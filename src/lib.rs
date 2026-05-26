@@ -17,6 +17,7 @@
 
 pub mod action;
 pub mod bus;
+pub mod daemon;
 pub mod event;
 pub mod fsm;
 pub mod state;

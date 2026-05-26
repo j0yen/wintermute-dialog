@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use wintermute_dialog::daemon;
 use wintermute_dialog::state::{Flags, StateTag};
 use wintermute_dialog::{Fsm, Transition};
 
@@ -33,9 +34,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run the long-lived daemon: subscribe to `wm.audio.*` / `wm.stt.*`
+    /// / `wm.brain.*` and publish `wm.dialog.*` plus the TTS/audio
+    /// control topics. Blocks until the agorabus closes the connection.
+    Start,
     /// Print the running daemon's FSM snapshot as JSON. iter-3 emits
-    /// a fresh-FSM snapshot (no daemon to query yet); iter-4 wires
-    /// the live agorabus query.
+    /// a fresh-FSM snapshot (no daemon to query yet); a future iter
+    /// wires the live agorabus query.
     State {
         /// Number of historical transitions to include (oldest →
         /// newest). 0 = none. PRD §2.6 `state --history N`.
@@ -87,11 +92,32 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Start => run_start(),
         Command::State { history } => run_state(history),
         Command::Mute => run_mute(),
         Command::Unmute => run_unmute(),
         Command::ChildLock { toggle } => run_child_lock(toggle),
         Command::Say { text } => run_say(&text),
+    }
+}
+
+fn run_start() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            error!(error = %err, "wm-dialog start: failed to build tokio runtime");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(daemon::run()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            error!(error = %err, "wm-dialog start: daemon exited with error");
+            ExitCode::from(1)
+        }
     }
 }
 

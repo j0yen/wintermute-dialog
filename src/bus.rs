@@ -62,6 +62,16 @@ pub mod outgoing {
     pub const UNMUTE_REQUEST: &str = "wm.dialog.unmute_request";
     /// Barge-in cancel into `wintermute-tts` (PRD §2.3).
     pub const TTS_CANCEL: &str = "wm.tts.cancel";
+    /// Render request into `wintermute-tts` for a brain reply or confirm
+    /// prompt (matches `wintermute-tts::incoming::SPEAK`).
+    pub const TTS_SPEAK: &str = "wm.tts.speak";
+    /// Forward the finalised transcript into `wintermute-brain` (PRD §2.2
+    /// `wm.stt.final` row — "forward to brain (wm.brain.utterance)").
+    pub const BRAIN_UTTERANCE: &str = "wm.brain.utterance";
+    /// Mute the audio capture layer (matches `wintermute-audio::Topics::MUTE`).
+    pub const AUDIO_MUTE: &str = "wm.audio.mute";
+    /// Release the audio capture mute gate (matches `wintermute-audio::Topics::UNMUTE`).
+    pub const AUDIO_UNMUTE: &str = "wm.audio.unmute";
 }
 
 /// Decoded request payloads. Returned by [`decode_request`].
@@ -502,6 +512,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "flat assertion table — splitting hurts the PRD-row-per-line layout"
+    )]
     fn topic_constants_match_prd_table() {
         assert_eq!(incoming::WAKE, "wm.audio.wake");
         assert_eq!(incoming::SPEECH_START, "wm.audio.speech.start");
@@ -519,6 +533,10 @@ mod tests {
         assert_eq!(outgoing::MUTE_REQUEST, "wm.dialog.mute_request");
         assert_eq!(outgoing::UNMUTE_REQUEST, "wm.dialog.unmute_request");
         assert_eq!(outgoing::TTS_CANCEL, "wm.tts.cancel");
+        assert_eq!(outgoing::TTS_SPEAK, "wm.tts.speak");
+        assert_eq!(outgoing::BRAIN_UTTERANCE, "wm.brain.utterance");
+        assert_eq!(outgoing::AUDIO_MUTE, "wm.audio.mute");
+        assert_eq!(outgoing::AUDIO_UNMUTE, "wm.audio.unmute");
         assert_eq!(SUBSCRIBE_PREFIXES, ["wm.audio.", "wm.stt.", "wm.brain."]);
     }
 
