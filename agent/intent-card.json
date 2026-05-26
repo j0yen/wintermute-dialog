@@ -1,0 +1,115 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "intent_slug": "wintermute-dialog",
+  "prd_source": "/home/jsy/wintermute/autobuilder/PRD-wintermute-dialog.md",
+  "root_motivation": "wm-dialog is the conversational state-machine daemon arbitrating between wm-audio, wm-stt, wm-tts, and wm-brain. It owns turn-taking, sub-200ms barge-in cancellation, the verbal-confirmation protocol for destructive intents, and mute/child-lock policies. Split out of wm-brain explicitly because timing-critical arbitration (≤200ms) and Claude API loops (500-5000ms) have incompatible latency budgets and debugging surfaces.",
+  "user_persona": "Two consumers. Primary: the wintermute fleet — wm-audio publishes wm.audio.wake / wm.audio.speech.*; wm-stt publishes wm.stt.partial / .final / .uncertain; wm-tts consumes wm.tts.cancel and emits wm.tts.start / .end; wm-brain consumes wm.dialog.turn.user and emits wm.brain.reply / .reply.destructive. Secondary: operators issue `wm-dialog state`, `wm-dialog mute`, `wm-dialog child-lock on|off`, `wm-dialog say <text>` from the shell. The end-user never invokes wm-dialog directly — she experiences it only through dialog ↔ tts via speech.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing",
+    "lower_is_better": false,
+    "harness_command": "cargo test --release --quiet -- --format=terse 2>&1 | awk '/test result:/ {gsub(\";\",\"\",$4); print $4}' | tail -1",
+    "target": 5
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "Wake during `speaking` cancels TTS and enters `listening` within 200 ms (measured wake-event to cancel-ack).",
+      "test": "tests/acceptance_ac1.rs::barge_in_cancels_under_200ms — drives a fake-bus DialogState through {idle → speaking} via wm.brain.reply, then publishes wm.audio.wake; asserts (a) wm.tts.cancel was published before the wake-handler returned, (b) state transitioned to listening, (c) the wall-clock from wake.detected publish to cancel-ack publish ≤ 200 ms under a controlled in-memory bus. Live-fleet variant tests/acceptance_ac1_live.rs::live_barge_in #[ignore]'d (requires running wm-audio + wm-tts)."
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "stt.uncertain triggers a re-prompt without leaving the state machine in a stuck state (verified by injecting 5 sequential uncertains).",
+      "test": "tests/acceptance_ac2.rs::stt_uncertain_re_prompts_and_recovers — injects 5 sequential wm.stt.uncertain events; asserts each emits exactly one re-prompt utterance via wm.tts.cancel-free wm.brain.reply-ish path AND the state machine returns to listening between each; no state-machine wedge (state cycles correctly, no transitions to a terminal error state)."
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "Verbal-confirm protocol grants on `yes <keyword>` exactly; denies on silence, `no`, `cancel`, or ambiguous-after-one-reprompt.",
+      "test": "tests/acceptance_ac3.rs::verbal_confirm_grant_and_deny_paths — feeds the verbal-confirmation FSM 6 scripted transcripts: (a) `yes delete-email` → wm.dialog.confirm.granted, (b) `yes` then `delete-email` → granted after re-prompt, (c) `no` → denied, (d) `cancel` → denied, (e) `stop` → denied, (f) silence (timeout-tick advance ≥ 30s) → denied; asserts payload intent_id round-trips correctly and each terminal event fires exactly once."
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "`wm-dialog mute` silences current TTS and gates wake within 200 ms; `unmute` restores both within 200 ms.",
+      "test": "tests/acceptance_ac4.rs::mute_gates_within_200ms — publishes wm.dialog.mute_request while in speaking state; asserts wm.tts.cancel published, wm.audio.mute published, subsequent wm.audio.wake events are ignored by the FSM, all within 200 ms wall-clock on the in-memory bus. Then publishes unmute_request; asserts wake gating released and a fresh wake.detected re-enters listening within 200 ms."
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "`child_lock = true` causes 100% of destructive intents in a 10-scenario test suite to be denied without verbal prompt.",
+      "test": "tests/acceptance_ac5.rs::child_lock_silently_denies_all — sets child_lock=true; feeds 10 distinct wm.brain.reply.destructive events with varying intent_id/summary/confirm_keyword; asserts each emits wm.dialog.confirm.denied with reason=child_lock and NO wm.tts.* utterance was published (silent-deny is the configurable default for this test)."
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "State machine transitions are logged with prior_state, new_state, trigger event, and elapsed-ms; logs queryable via `wm-dialog state --history N`.",
+      "test": "tests/acceptance_ac6.rs::state_history_query_roundtrips — drives 12 transitions through a DialogState fed by a fake bus; invokes the state-history API (in-process equivalent of `wm-dialog state --history 5`); asserts the returned list contains exactly the 5 most-recent transitions, each with prior_state, new_state, trigger, elapsed_ms ≥ 0, and a monotonic ts."
+    },
+    {
+      "id": "AC7",
+      "level": "SHOULD",
+      "description": "60-minute steady-state run with 50 simulated turns shows no state-machine wedges (deadlocks, stuck-in-confirming, etc.).",
+      "test": "tests/acceptance_ac7.rs::soak_60min_no_wedges — gated #[ignore] (long-running). Manual procedure documented in test doc-comment: run wm-dialog under procstat for 60 min with a 50-turn fake-driver mixing turn/uncertain/destructive/mute events; assert at end (a) state is one of {idle, listening, speaking}, (b) zero pending confirms, (c) event-count parity dialog↔brain↔tts, (d) RSS growth < 50 MB."
+    }
+  ],
+  "scope": [
+    "Rust binary `wm-dialog`: long-lived daemon. On startup subscribes to wm.audio.wake / wm.audio.speech.start / .end / wm.stt.partial / .final / .uncertain / wm.brain.reply / wm.brain.reply.destructive over agorabus; publishes wm.dialog.state / .turn.user / .turn.system / .confirm.granted / .confirm.denied / .mute_request / .unmute_request.",
+    "State machine: idle → listening (wake.detected) → transcribing (speech.start) → thinking (stt.final, forward to brain) → speaking (brain.reply) → idle (tts.end). Branch: thinking → confirming (brain.reply.destructive) → idle (granted/denied). Orthogonal: muted (top-level mute gate), child_locked (blocks confirming → execute).",
+    "Barge-in: wake.detected while in speaking publishes wm.tts.cancel and transitions to listening. Total budget 200 ms wake-to-cancel-ack.",
+    "Verbal-confirm protocol: on wm.brain.reply.destructive{intent_id, summary, confirm_keyword} enter confirming with 30 s timeout, speak prompt via wm-tts, parse next stt.final against (yes <keyword>) | yes-alone-reprompt | (no|cancel|stop) | silence | other-reprompt-once-then-deny; publish granted or denied with intent_id.",
+    "Mute / child-lock: mute_request cancels current TTS and gates wake (wm.audio.mute) until unmute_request; child_lock=true auto-denies destructive intents silently (or with a configurable spoken refusal).",
+    "CLI: `wm-dialog state` (JSON), `wm-dialog mute|unmute`, `wm-dialog child-lock on|off`, `wm-dialog state --history N`, `wm-dialog say <text>` (debug — drive speaking from CLI).",
+    "Logging: every state transition records prior_state, new_state, trigger event, elapsed_ms; bounded in-memory ring buffer (e.g. 256 entries) plus optional tracing-subscriber emission for journald.",
+    "Hand-rolled FSM (avoiding statig for v1 to keep the dependency surface small and the compile-time exhaustiveness check explicit via a non_exhaustive match-+covered_by-test pattern). Revisit statig if FSM grows past ~10 states."
+  ],
+  "non_goals": [
+    "Wake-word detection — owned by wm-audio.",
+    "Speech-to-text — owned by wm-stt.",
+    "Text-to-speech rendering / audio output — owned by wm-tts.",
+    "LLM conversation loop / tool-router — owned by wm-brain.",
+    "Quiet-hours scheduling — Fleet 3 (`wintermute-quiet-hours`).",
+    "Multi-user disambiguation / speaker recognition — Fleet 3.",
+    "Always-listening intent classifier for `stop talking` without wake — iter-2+ if natural conversation demands it (Open Q in PRD §7).",
+    "Conversational repair beyond a single re-prompt — Fleet 2 polish.",
+    "TTS streaming with mid-sentence interjection — Fleet 3."
+  ],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 15,
+    "msrv": "1.85",
+    "additional": {
+      "bin_name": "wm-dialog",
+      "barge_in_budget_ms": 200,
+      "mute_gate_budget_ms": 200,
+      "confirm_timeout_s": 30,
+      "max_reprompts": 1,
+      "history_ring_size": 256
+    }
+  },
+  "ambiguities_resolved": [
+    {
+      "key": "fsm_library",
+      "decision": "hand-rolled FSM with explicit match + exhaustiveness covered by AC2/AC6 tests",
+      "rationale": "PRD §3 lists `statig` as an option (^0.3). Keeping the v1 dep surface small (max_deps=15) and the FSM small enough (~6 states + 2 orthogonal) that compile-time exhaustiveness via match arms is sufficient. Revisit statig if the FSM grows past ~10 states or orthogonal product cases."
+    },
+    {
+      "key": "child_lock_default_response",
+      "decision": "silent deny by default (no spoken refusal); configurable via WM_DIALOG_CHILD_LOCK_RESPONSE env",
+      "rationale": "PRD §2.5 says 'auto-denied silently (or with a configurable I can't do that for you reply)'. v1 ships silent-deny to avoid revealing child-lock state to anyone within earshot; opt-in to spoken refusal for caregiver/operator use."
+    },
+    {
+      "key": "history_ring_size",
+      "decision": "256 transitions, in-memory bounded ring",
+      "rationale": "PRD §4 AC6 requires queryable history but doesn't specify retention. 256 covers ~30 minutes of mixed-traffic at observed rates; bigger histories should land in recall via a separate observer if needed."
+    },
+    {
+      "key": "barge_in_during_confirming",
+      "decision": "barge-in during confirming cancels the confirm flow entirely, treated as deny with reason=barge_in",
+      "rationale": "PRD §6 risks call this out explicitly. AC1 covers barge-in from speaking; AC3 implicitly covers the confirm-grant/deny paths. A dedicated tests/acceptance_ac1_b.rs barge-in-from-confirming variant may land in iter-2."
+    }
+  ]
+}
