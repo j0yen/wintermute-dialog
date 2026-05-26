@@ -2,6 +2,7 @@
 //!
 //! Generated stub. The edit-agent replaces this body across iterations.
 
+#[allow(clippy::print_stderr)]
 fn main() -> std::process::ExitCode {
     eprintln!("wm-dialog: stub — implement me");
     std::process::ExitCode::from(2)
