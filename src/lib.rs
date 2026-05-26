@@ -16,6 +16,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod action;
+pub mod bus;
 pub mod event;
 pub mod fsm;
 pub mod state;
