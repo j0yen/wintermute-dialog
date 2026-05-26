@@ -9,19 +9,23 @@
 //! stream (same pattern as `wintermute-stt/src/daemon.rs` iter-5 and
 //! `wintermute-tts/src/daemon.rs` iter-5).
 //!
-//! iter-5 scope is wiring the subscribe + publish path only. The
-//! confirm-timeout timer subsystem ([`crate::Action::StartConfirmTimer`]
-//! / [`crate::Action::CancelConfirmTimer`]) is logged but not yet
-//! driven — without it the FSM stays in `Confirming` indefinitely on
-//! silence. That wiring lands in iter-6 alongside the
-//! `Event::ConfirmTimeout` re-entry path.
+//! iter-6 adds the confirm-timeout scheduler. [`ConfirmTimer`] owns the
+//! in-flight 30s sleep task that [`crate::Action::StartConfirmTimer`]
+//! and [`crate::Action::CancelConfirmTimer`] manipulate. When the timer
+//! elapses it pushes [`crate::Event::ConfirmTimeout`] back into the
+//! same dispatch path via an `mpsc::UnboundedSender`, and the FSM's
+//! `Confirming → Idle` silence branch fires. Each `start` invalidates
+//! the prior generation via an atomic flag so a reprompt's new timer
+//! cannot lose a race with the old one's late delivery.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{Duration, sleep};
+use tracing::{error, info, warn};
 
 use crate::action::DenyReason;
 use crate::bus::{
@@ -80,6 +84,60 @@ impl DaemonState {
         Self {
             fsm: Mutex::const_new(fsm),
         }
+    }
+}
+
+/// Drives [`Action::StartConfirmTimer`] / [`Action::CancelConfirmTimer`].
+///
+/// Owns the in-flight `sleep`-then-emit task. `start` and `cancel`
+/// invalidate the prior generation via an [`AtomicBool`] so a late send
+/// from an old task is suppressed after the FSM has already moved on.
+pub struct ConfirmTimer {
+    /// Activation flag for the *current* generation. Each `start`
+    /// installs a fresh `Arc`; old tasks check this before sending.
+    active: Arc<AtomicBool>,
+    /// Channel back into the dispatch loop for [`Event::ConfirmTimeout`].
+    events_tx: mpsc::UnboundedSender<Event>,
+}
+
+impl ConfirmTimer {
+    /// Construct a timer that feeds events into `events_tx`.
+    #[must_use]
+    pub fn new(events_tx: mpsc::UnboundedSender<Event>) -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(false)),
+            events_tx,
+        }
+    }
+
+    /// Schedule [`Event::ConfirmTimeout`] to fire after `ms`
+    /// milliseconds. Replaces any in-flight timer: the prior generation
+    /// flips its flag to inactive and its late send becomes a no-op.
+    pub fn start(&mut self, ms: u32) {
+        self.cancel();
+        let active = Arc::new(AtomicBool::new(true));
+        self.active = Arc::clone(&active);
+        let tx = self.events_tx.clone();
+        let delay = Duration::from_millis(u64::from(ms));
+        tokio::spawn(async move {
+            sleep(delay).await;
+            if active.load(Ordering::SeqCst) && tx.send(Event::ConfirmTimeout).is_err() {
+                // Receiver dropped — daemon shutting down. Silent.
+            }
+        });
+    }
+
+    /// Suppress any in-flight timer. Safe to call when no timer is
+    /// scheduled (no-op).
+    pub fn cancel(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the current generation has not yet been cancelled.
+    /// Exposed for tests; production code only cares about the channel.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
     }
 }
 
@@ -191,7 +249,8 @@ pub fn action_to_value(action: &Action, ts: u64) -> Result<Option<Value>> {
 }
 
 /// Dispatch one decoded request: feed it to the FSM, then publish every
-/// resulting action through `publish`.
+/// resulting action through `publish` and drive every timer action
+/// through `timer`.
 ///
 /// # Errors
 /// Returns the first publish failure encountered while flushing the
@@ -199,6 +258,7 @@ pub fn action_to_value(action: &Action, ts: u64) -> Result<Option<Value>> {
 pub async fn dispatch(
     state: &DaemonState,
     publish: &mut dyn EventSink,
+    timer: &mut ConfirmTimer,
     event: Event,
     now_ms: u64,
 ) -> Result<()> {
@@ -214,14 +274,11 @@ pub async fn dispatch(
                     publish.publish(topic, payload).await?;
                 }
             }
-            None => {
-                // Timer-manipulation variant. iter-6 wires the scheduler;
-                // for now we record the intent and continue.
-                debug!(
-                    ?action,
-                    "wm-dialog: confirm-timer action not yet driven (iter-6)"
-                );
-            }
+            None => match action {
+                Action::StartConfirmTimer { ms } => timer.start(*ms),
+                Action::CancelConfirmTimer => timer.cancel(),
+                _ => {}
+            },
         }
     }
     Ok(())
@@ -235,9 +292,12 @@ pub fn fresh_state(now_ms: u64) -> Arc<DaemonState> {
     Arc::new(DaemonState::new(Fsm::new(now_ms)))
 }
 
-/// Run the live daemon: build the FSM, connect to agorabus, subscribe to
-/// each prefix in [`bus::SUBSCRIBE_PREFIXES`], dispatch each event until
-/// the bus closes.
+/// Run the live daemon.
+///
+/// Builds the FSM, connects to agorabus, subscribes to each prefix in
+/// [`bus::SUBSCRIBE_PREFIXES`], multiplexes bus events with internal
+/// timer events, and dispatches each through the FSM until the bus
+/// closes.
 ///
 /// # Errors
 /// Propagates I/O failures from the agorabus client. A missing agorabus
@@ -246,6 +306,8 @@ pub fn fresh_state(now_ms: u64) -> Arc<DaemonState> {
 /// `wm-stt` / `wm-tts`).
 pub async fn run() -> Result<()> {
     let state = fresh_state(now_unix_ms());
+    let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<Event>();
+    let mut timer = ConfirmTimer::new(timer_tx);
 
     let sock = agorabus::default_socket_path();
     let Some(mut sub_client) = agorabus::Client::try_connect(&sock).await? else {
@@ -263,22 +325,38 @@ pub async fn run() -> Result<()> {
     let pub_client = agorabus::Client::connect(&sock).await?;
     let mut sink = AgoraSink { inner: pub_client };
 
-    while let Some(ev) = sub_client.next_event().await? {
-        match decode_request(&ev.topic, &ev.data) {
-            Ok(req) => {
-                let event = request_to_event(req);
-                let now = now_unix_ms();
-                if let Err(err) = dispatch(state.as_ref(), &mut sink, event, now).await {
-                    error!(topic = %ev.topic, err = %err, "wm-dialog: dispatch failed");
+    loop {
+        tokio::select! {
+            next = sub_client.next_event() => {
+                match next? {
+                    None => {
+                        info!("wm-dialog: bus closed; daemon exiting");
+                        return Ok(());
+                    }
+                    Some(ev) => {
+                        match decode_request(&ev.topic, &ev.data) {
+                            Ok(request) => {
+                                let event = request_to_event(request);
+                                let now = now_unix_ms();
+                                if let Err(err) = dispatch(state.as_ref(), &mut sink, &mut timer, event, now).await {
+                                    error!(topic = %ev.topic, err = %err, "wm-dialog: dispatch failed");
+                                }
+                            }
+                            Err(err) => {
+                                warn!(topic = %ev.topic, err = %err, "wm-dialog: decode failed");
+                            }
+                        }
+                    }
                 }
             }
-            Err(err) => {
-                warn!(topic = %ev.topic, err = %err, "wm-dialog: decode failed");
+            Some(event) = timer_rx.recv() => {
+                let now = now_unix_ms();
+                if let Err(err) = dispatch(state.as_ref(), &mut sink, &mut timer, event, now).await {
+                    error!(err = %err, "wm-dialog: timer dispatch failed");
+                }
             }
         }
     }
-    info!("wm-dialog: bus closed; daemon exiting");
-    Ok(())
 }
 
 const fn state_tag_snake(tag: StateTag) -> &'static str {
@@ -319,6 +397,16 @@ mod tests {
         SttFinalPayload, SttPartialPayload, SttUncertainPayload, WakePayload,
     };
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration as StdDuration;
+    use tokio::time::timeout;
+
+    /// Construct a fresh [`ConfirmTimer`] paired with the receiver side
+    /// of its event channel. Tests that don't exercise the timer can
+    /// discard `_rx`; timer-focused tests drain it.
+    fn fresh_timer() -> (ConfirmTimer, mpsc::UnboundedReceiver<Event>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (ConfirmTimer::new(tx), rx)
+    }
 
     /// In-memory publish sink for unit tests.
     #[derive(Default, Clone)]
@@ -549,7 +637,8 @@ mod tests {
     async fn dispatch_audio_wake_publishes_state_idle_to_listening() {
         let state = fresh_state(0);
         let mut sink = MemSink::default();
-        dispatch(state.as_ref(), &mut sink, Event::AudioWake, 100)
+        let (mut timer, _trx) = fresh_timer();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 100)
             .await
             .expect("dispatch ok");
         assert_eq!(sink.topics(), vec![outgoing::STATE.to_string()]);
@@ -563,17 +652,19 @@ mod tests {
     async fn dispatch_stt_final_publishes_turn_user_brain_utterance_then_state() {
         let state = fresh_state(0);
         let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
         // Drive to Transcribing first.
-        dispatch(state.as_ref(), &mut sink, Event::AudioWake, 10)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .expect("wake");
-        dispatch(state.as_ref(), &mut sink, Event::AudioSpeechStart, 20)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .expect("speech start");
         sink.events.lock().unwrap().clear();
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::SttFinal {
                 transcript: "what time is it".to_string(),
                 confidence: 0.91,
@@ -608,16 +699,18 @@ mod tests {
     async fn dispatch_brain_reply_publishes_turn_system_tts_speak_then_state() {
         let state = fresh_state(0);
         let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
         // Drive to Thinking.
-        dispatch(state.as_ref(), &mut sink, Event::AudioWake, 10)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, Event::AudioSpeechStart, 20)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::SttFinal {
                 transcript: "hi".into(),
                 confidence: 0.99,
@@ -631,6 +724,7 @@ mod tests {
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::BrainReply {
                 text: "hello there".to_string(),
             },
@@ -657,16 +751,18 @@ mod tests {
     async fn dispatch_barge_in_publishes_tts_cancel_then_state() {
         let state = fresh_state(0);
         let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
         // Drive to Speaking.
-        dispatch(state.as_ref(), &mut sink, Event::AudioWake, 10)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, Event::AudioSpeechStart, 20)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::SttFinal {
                 transcript: "hi".into(),
                 confidence: 1.0,
@@ -678,6 +774,7 @@ mod tests {
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::BrainReply {
                 text: "long reply".into(),
             },
@@ -688,7 +785,7 @@ mod tests {
         sink.events.lock().unwrap().clear();
 
         // Wake during speaking → barge-in.
-        dispatch(state.as_ref(), &mut sink, Event::AudioWake, 50)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 50)
             .await
             .expect("barge-in");
         let topics = sink.topics();
@@ -705,19 +802,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_destructive_publishes_tts_speak_then_state_and_swallows_timer_action() {
+    async fn dispatch_destructive_publishes_tts_speak_then_state_and_arms_timer() {
         let state = fresh_state(0);
         let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
         // Drive to Thinking.
-        dispatch(state.as_ref(), &mut sink, Event::AudioWake, 10)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, Event::AudioSpeechStart, 20)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::SttFinal {
                 transcript: "delete it".into(),
                 confidence: 0.9,
@@ -731,6 +830,7 @@ mod tests {
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::BrainReplyDestructive {
                 intent_id: "i-7".into(),
                 summary: "delete the newsletter".into(),
@@ -741,7 +841,7 @@ mod tests {
         .await
         .expect("destructive dispatch");
         let topics = sink.topics();
-        // Order: PublishTtsSay → StartConfirmTimer (silently dropped) → PublishState.
+        // Order: PublishTtsSay → StartConfirmTimer (arms timer, no bus topic) → PublishState.
         assert_eq!(
             topics,
             vec![
@@ -759,30 +859,34 @@ mod tests {
         );
         let state_p = sink.payload(outgoing::STATE);
         assert_eq!(state_p["state"], "confirming");
+        assert!(timer.is_active(), "destructive prompt arms the confirm timer");
     }
 
     #[tokio::test]
     async fn dispatch_child_lock_destructive_publishes_confirm_denied_silently() {
         let state = fresh_state(0);
         let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
         // Engage child lock + drive to Thinking.
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::SetChildLock { enabled: true },
             5,
         )
         .await
         .unwrap();
-        dispatch(state.as_ref(), &mut sink, Event::AudioWake, 10)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, Event::AudioSpeechStart, 20)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::SttFinal {
                 transcript: "drop the db".into(),
                 confidence: 0.9,
@@ -796,6 +900,7 @@ mod tests {
         dispatch(
             state.as_ref(),
             &mut sink,
+            &mut timer,
             Event::BrainReplyDestructive {
                 intent_id: "i-8".into(),
                 summary: "drop the user database".into(),
@@ -826,14 +931,15 @@ mod tests {
     async fn dispatch_mute_publishes_audio_mute_and_unmute() {
         let state = fresh_state(0);
         let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
         // Mute from idle: publishes wm.audio.mute only (no state transition).
-        dispatch(state.as_ref(), &mut sink, Event::MuteRequest, 10)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::MuteRequest, 10)
             .await
             .expect("mute");
         assert_eq!(sink.topics(), vec![outgoing::AUDIO_MUTE.to_string()]);
         sink.events.lock().unwrap().clear();
 
-        dispatch(state.as_ref(), &mut sink, Event::UnmuteRequest, 20)
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::UnmuteRequest, 20)
             .await
             .expect("unmute");
         assert_eq!(sink.topics(), vec![outgoing::AUDIO_UNMUTE.to_string()]);
@@ -856,5 +962,171 @@ mod tests {
         assert_eq!(deny_reason_snake(DenyReason::Ambiguous), "ambiguous");
         assert_eq!(deny_reason_snake(DenyReason::ChildLock), "child_lock");
         assert_eq!(deny_reason_snake(DenyReason::BargeIn), "barge_in");
+    }
+
+    // ── ConfirmTimer ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn confirm_timer_fires_event_after_delay() {
+        let (mut timer, mut rx) = fresh_timer();
+        timer.start(20);
+        let ev = timeout(StdDuration::from_millis(500), rx.recv())
+            .await
+            .expect("timer fired before deadline")
+            .expect("channel still open");
+        assert_eq!(ev, Event::ConfirmTimeout);
+    }
+
+    #[tokio::test]
+    async fn confirm_timer_cancel_suppresses_event() {
+        let (mut timer, mut rx) = fresh_timer();
+        timer.start(20);
+        timer.cancel();
+        assert!(!timer.is_active(), "cancel flips active flag");
+        let res = timeout(StdDuration::from_millis(80), rx.recv()).await;
+        assert!(res.is_err(), "no ConfirmTimeout expected within 80ms");
+    }
+
+    #[tokio::test]
+    async fn confirm_timer_restart_invalidates_prior_generation() {
+        let (mut timer, mut rx) = fresh_timer();
+        // Long-fuse timer that we then replace before it fires.
+        timer.start(10_000);
+        // Replace it with a quick one; the prior task's send must be
+        // suppressed because we flipped its generation's flag.
+        timer.start(20);
+        let ev = timeout(StdDuration::from_millis(500), rx.recv())
+            .await
+            .expect("replacement timer fires")
+            .expect("channel still open");
+        assert_eq!(ev, Event::ConfirmTimeout);
+        // No second event should arrive (give the long-fuse task a moment).
+        let res = timeout(StdDuration::from_millis(80), rx.recv()).await;
+        assert!(res.is_err(), "prior generation must not deliver a second event");
+    }
+
+    #[tokio::test]
+    async fn dispatch_start_timer_arms_then_cancel_clears() {
+        let state = fresh_state(0);
+        let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
+        // Drive to Confirming (destructive reply arms the timer).
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::SttFinal {
+                transcript: "delete it".into(),
+                confidence: 0.9,
+            },
+            30,
+        )
+        .await
+        .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::BrainReplyDestructive {
+                intent_id: "i-9".into(),
+                summary: "drop x".into(),
+                confirm_keyword: "drop-x".into(),
+            },
+            40,
+        )
+        .await
+        .unwrap();
+        assert!(timer.is_active(), "destructive prompt armed the timer");
+        // A grant utterance emits CancelConfirmTimer; that clears the flag.
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::SttFinal {
+                transcript: "yes drop-x".into(),
+                confidence: 1.0,
+            },
+            50,
+        )
+        .await
+        .unwrap();
+        assert!(!timer.is_active(), "verbal grant cancelled the timer");
+    }
+
+    #[tokio::test]
+    async fn timer_event_drives_confirm_denied_silence_when_in_confirming() {
+        let state = fresh_state(0);
+        let mut sink = MemSink::default();
+        let (mut timer, mut rx) = fresh_timer();
+        // Drive to Confirming.
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::SttFinal {
+                transcript: "delete it".into(),
+                confidence: 0.9,
+            },
+            30,
+        )
+        .await
+        .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::BrainReplyDestructive {
+                intent_id: "i-10".into(),
+                summary: "drop x".into(),
+                confirm_keyword: "drop-x".into(),
+            },
+            40,
+        )
+        .await
+        .unwrap();
+        // Drain the bus events from the prompt so we only see the timeout fan-out.
+        sink.events.lock().unwrap().clear();
+
+        // Replace the FSM-armed 30s timer with a short fuse for the test.
+        timer.start(20);
+        let ev = timeout(StdDuration::from_millis(500), rx.recv())
+            .await
+            .expect("timer fired")
+            .expect("channel open");
+        assert_eq!(ev, Event::ConfirmTimeout);
+
+        // Feed the timer event back through dispatch — the FSM in
+        // Confirming should publish ConfirmDenied(silence) and return
+        // to Idle, with CancelConfirmTimer clearing the flag.
+        dispatch(state.as_ref(), &mut sink, &mut timer, ev, 100)
+            .await
+            .expect("timeout dispatch");
+        let topics = sink.topics();
+        assert_eq!(
+            topics,
+            vec![
+                outgoing::CONFIRM_DENIED.to_string(),
+                outgoing::STATE.to_string(),
+            ]
+        );
+        let denied = sink.payload(outgoing::CONFIRM_DENIED);
+        assert_eq!(denied["intent_id"], "i-10");
+        assert_eq!(denied["reason"], "silence");
+        let state_p = sink.payload(outgoing::STATE);
+        assert_eq!(state_p["state"], "idle");
+        assert_eq!(state_p["prior_state"], "confirming");
+        assert!(!timer.is_active(), "timeout flow cancelled the timer");
     }
 }
