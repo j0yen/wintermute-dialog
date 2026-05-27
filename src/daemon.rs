@@ -927,6 +927,99 @@ mod tests {
         );
     }
 
+    /// PRD §4 AC5: with `child_lock = true`, 100% of destructive
+    /// intents in a 10-scenario suite must be denied without a verbal
+    /// prompt. Labels chosen to span Fleet 1 + Fleet 2 surfaces (mail,
+    /// fs, calendar, purchase, recall forget, desktop power, music,
+    /// SMS) so a future tool addition that bypasses the child-lock
+    /// branch trips this fixture.
+    #[tokio::test]
+    async fn ac5_ten_scenario_child_lock_denies_destructive_silently() {
+        let scenarios: [(&str, &str, &str); 10] = [
+            ("delete-email", "delete the newsletter", "delete-email"),
+            ("send-dm", "send a DM to Sam", "send-dm"),
+            ("drop-database", "drop the user database", "drop-db"),
+            ("purchase", "place an order for cat litter", "buy-litter"),
+            ("calendar-cancel", "cancel tomorrow's appointment", "cancel-appt"),
+            ("file-rm", "delete the notes folder", "rm-notes"),
+            ("recall-forget", "forget the chamomile memory", "forget-chamomile"),
+            ("desktop-shutdown", "shut down the laptop", "shutdown-laptop"),
+            ("music-purchase", "buy that album", "buy-album"),
+            ("text-message", "text my sister", "text-sister"),
+        ];
+
+        for (label, summary, confirm_keyword) in scenarios {
+            let state = fresh_state(0);
+            let mut sink = MemSink::default();
+            let (mut timer, _trx) = fresh_timer();
+
+            // Engage child lock + drive to Thinking.
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                &mut timer,
+                Event::SetChildLock { enabled: true },
+                5,
+            )
+            .await
+            .unwrap();
+            dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+                .await
+                .unwrap();
+            dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+                .await
+                .unwrap();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                &mut timer,
+                Event::SttFinal {
+                    transcript: "do the destructive thing".into(),
+                    confidence: 0.9,
+                },
+                30,
+            )
+            .await
+            .unwrap();
+            sink.events.lock().unwrap().clear();
+
+            let intent_id = format!("intent-{label}");
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                &mut timer,
+                Event::BrainReplyDestructive {
+                    intent_id: intent_id.clone(),
+                    summary: summary.to_string(),
+                    confirm_keyword: confirm_keyword.to_string(),
+                },
+                40,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("scenario {label}: dispatch failed: {e:?}"));
+
+            let topics = sink.topics();
+            assert_eq!(
+                topics,
+                vec![
+                    outgoing::CONFIRM_DENIED.to_string(),
+                    outgoing::STATE.to_string(),
+                ],
+                "scenario {label}: expected ConfirmDenied + State only, got {topics:?}",
+            );
+            let denied = sink.payload(outgoing::CONFIRM_DENIED);
+            assert_eq!(denied["reason"], "child_lock", "scenario {label}: deny reason");
+            assert!(
+                !topics.iter().any(|t| t == outgoing::TTS_SPEAK),
+                "scenario {label}: child lock must deny silently — no TTS prompt"
+            );
+            assert!(
+                !timer.is_active(),
+                "scenario {label}: silent deny must NOT arm the confirm timer"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_mute_publishes_audio_mute_and_unmute() {
         let state = fresh_state(0);
