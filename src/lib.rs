@@ -23,6 +23,10 @@ pub mod fsm;
 pub mod state;
 
 pub use action::{Action, DenyReason};
+pub use daemon::{
+    DEFAULT_SNAPSHOT_HISTORY_N, StateSnapshot, default_snapshot_path, read_snapshot,
+    write_snapshot_atomic,
+};
 pub use event::{Event, EventTag};
 pub use fsm::{CONFIRM_TIMEOUT_MS, DEFAULT_HISTORY_CAPACITY, Fsm, MAX_REPROMPTS, Transition};
 pub use state::{ConfirmContext, Flags, State, StateTag};

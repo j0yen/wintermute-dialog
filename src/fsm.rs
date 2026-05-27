@@ -94,6 +94,14 @@ impl Fsm {
         self.flags
     }
 
+    /// Monotonic-ish timestamp (ms) of the most recent state transition.
+    /// `now_ms - last_change_ms()` is the canonical `since_ms` used in
+    /// the public `StateReport` / `StateSnapshot`.
+    #[must_use]
+    pub const fn last_change_ms(&self) -> u64 {
+        self.last_change_ms
+    }
+
     /// Most-recent `n` transitions in chronological order. If `n`
     /// exceeds the ring's length, returns the whole ring.
     #[must_use]

@@ -18,10 +18,12 @@
 //! the prior generation via an atomic flag so a reprompt's new timer
 //! cannot lose a race with the old one's late delivery.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, sleep};
@@ -32,8 +34,8 @@ use crate::bus::{
     self, ConfirmDeniedEvent, ConfirmGrantedEvent, MuteRequestEvent, Request, StateEvent,
     TtsCancelEvent, TurnSystemEvent, TurnUserEvent, decode_request, now_unix_ms, outgoing,
 };
-use crate::state::StateTag;
-use crate::{Action, Event, Fsm};
+use crate::state::{Flags, StateTag};
+use crate::{Action, Event, Fsm, Transition};
 
 /// Publish abstraction so per-event dispatch can be tested without a
 /// real agorabus daemon. Production impl is [`AgoraSink`]; tests use an
@@ -85,6 +87,137 @@ impl DaemonState {
             fsm: Mutex::const_new(fsm),
         }
     }
+
+    /// Build a JSON-stable snapshot of the live FSM. `history_n` caps
+    /// the returned [`Transition`] ring; `now_ms` is the monotonic clock
+    /// at snapshot time and feeds the `since_ms` field.
+    ///
+    /// The daemon's `run()` loop calls this after every dispatch and
+    /// hands the result to [`write_snapshot_atomic`] so a separate
+    /// `wm-dialog state --history N` process can observe the live ring
+    /// without round-tripping through the bus. AC6 (PRD §4 #6).
+    pub async fn snapshot(&self, history_n: usize, now_ms: u64) -> StateSnapshot {
+        let fsm = self.fsm.lock().await;
+        StateSnapshot {
+            state: fsm.state().tag(),
+            flags: fsm.flags(),
+            since_ms: now_ms.saturating_sub(fsm.last_change_ms()),
+            history: fsm.history(history_n),
+            snapshot_ms: now_ms,
+        }
+    }
+}
+
+/// JSON-stable FSM snapshot.
+///
+/// The daemon writes one to [`default_snapshot_path()`] after every
+/// dispatch; the `wm-dialog state --history N` CLI reads it and
+/// prints a truncated copy. The CLI falls back to a fresh-FSM
+/// snapshot if no file exists. AC6.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateSnapshot {
+    /// Current FSM tag (idle, listening, …).
+    pub state: StateTag,
+    /// Orthogonal mute / child-lock flags.
+    pub flags: Flags,
+    /// Milliseconds since the most recent state transition. Computed
+    /// from `now_ms - fsm.last_change_ms()` at snapshot time.
+    pub since_ms: u64,
+    /// Most-recent transitions in chronological order, capped to the
+    /// `history_n` passed to [`DaemonState::snapshot`].
+    pub history: Vec<Transition>,
+    /// Wall-clock UNIX-ms at which this snapshot was built. Lets the
+    /// CLI report freshness (and a future iter prune stale files).
+    pub snapshot_ms: u64,
+}
+
+/// Resolve the default location for the daemon's live state snapshot.
+///
+/// Honors `$WM_DIALOG_SNAPSHOT_PATH` first (used by tests), then
+/// `$XDG_RUNTIME_DIR/wm-dialog/state.json`, falling back to
+/// `/run/user/$UID/wm-dialog/state.json` and finally
+/// `/tmp/wm-dialog-$UID/state.json`.
+#[must_use]
+pub fn default_snapshot_path() -> PathBuf {
+    if let Ok(override_path) = std::env::var("WM_DIALOG_SNAPSHOT_PATH") {
+        return PathBuf::from(override_path);
+    }
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("wm-dialog").join("state.json");
+        }
+    }
+    let uid = uid_from_proc();
+    let run_user = Path::new("/run/user").join(uid.to_string());
+    if run_user.is_dir() {
+        return run_user.join("wm-dialog").join("state.json");
+    }
+    Path::new("/tmp")
+        .join(format!("wm-dialog-{uid}"))
+        .join("state.json")
+}
+
+/// Read the current process's UID without pulling in `libc`. Parses
+/// `/proc/self/status` (Linux-only, which is this crate's only target).
+fn uid_from_proc() -> u32 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            if let Some(first) = rest.split_whitespace().next() {
+                if let Ok(uid) = first.parse::<u32>() {
+                    return uid;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Atomic write the snapshot JSON to `path`.
+///
+/// Creates the parent directory if missing. Writes to `<path>.tmp`
+/// then `rename`s into place so a concurrent reader either sees the
+/// prior snapshot or the new one — never a torn write. Best-effort:
+/// the caller (`run()`) logs and continues on failure.
+///
+/// # Errors
+/// Propagates filesystem and serialization failures.
+pub fn write_snapshot_atomic(path: &Path, snap: &StateSnapshot) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create snapshot dir {}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(snap).context("serialize snapshot")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)
+        .with_context(|| format!("write snapshot tmp {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename snapshot into {}", path.display()))?;
+    Ok(())
+}
+
+/// Read a snapshot JSON file.
+///
+/// Returns `Ok(None)` if the file does not exist (the daemon hasn't
+/// run yet, or its socket is on a different runtime dir) — the CLI
+/// uses this to fall back to a fresh-FSM snapshot. Returns `Err` for
+/// parse failures so the CLI can warn.
+///
+/// # Errors
+/// Returns `Err` on parse failure or I/O errors other than
+/// `NotFound`.
+pub fn read_snapshot(path: &Path) -> Result<Option<StateSnapshot>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("read snapshot {}", path.display()));
+        }
+    };
+    let snap = serde_json::from_slice::<StateSnapshot>(&bytes)
+        .with_context(|| format!("parse snapshot {}", path.display()))?;
+    Ok(Some(snap))
 }
 
 /// Drives [`Action::StartConfirmTimer`] / [`Action::CancelConfirmTimer`].
@@ -304,6 +437,10 @@ pub fn fresh_state(now_ms: u64) -> Arc<DaemonState> {
 /// socket is *not* an error: the daemon logs and exits cleanly so the
 /// systemd unit restarts it when the bus comes back (same pattern as
 /// `wm-stt` / `wm-tts`).
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "single subscribe-loop with explicit error logging branches; splitting hurts readability"
+)]
 pub async fn run() -> Result<()> {
     let state = fresh_state(now_unix_ms());
     let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<Event>();
@@ -325,6 +462,13 @@ pub async fn run() -> Result<()> {
     let pub_client = agorabus::Client::connect(&sock).await?;
     let mut sink = AgoraSink { inner: pub_client };
 
+    let snapshot_path = default_snapshot_path();
+    info!(path = %snapshot_path.display(), "wm-dialog: snapshot file");
+    // Initial snapshot so a freshly-started daemon is immediately
+    // queryable via `wm-dialog state --history N` before the first
+    // bus event arrives.
+    write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now_unix_ms()).await;
+
     loop {
         tokio::select! {
             next = sub_client.next_event() => {
@@ -341,6 +485,7 @@ pub async fn run() -> Result<()> {
                                 if let Err(err) = dispatch(state.as_ref(), &mut sink, &mut timer, event, now).await {
                                     error!(topic = %ev.topic, err = %err, "wm-dialog: dispatch failed");
                                 }
+                                write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now).await;
                             }
                             Err(err) => {
                                 warn!(topic = %ev.topic, err = %err, "wm-dialog: decode failed");
@@ -354,10 +499,26 @@ pub async fn run() -> Result<()> {
                 if let Err(err) = dispatch(state.as_ref(), &mut sink, &mut timer, event, now).await {
                     error!(err = %err, "wm-dialog: timer dispatch failed");
                 }
+                write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now).await;
             }
         }
     }
 }
+
+/// Capture and write the live FSM snapshot to disk. Best-effort: logs
+/// and continues on any failure (a slow disk or full filesystem must
+/// not crash the daemon — the bus loop remains the source of truth).
+async fn write_state_snapshot_best_effort(state: &DaemonState, path: &Path, now_ms: u64) {
+    let snap = state.snapshot(DEFAULT_SNAPSHOT_HISTORY_N, now_ms).await;
+    if let Err(err) = write_snapshot_atomic(path, &snap) {
+        warn!(path = %path.display(), err = %err, "wm-dialog: snapshot write failed");
+    }
+}
+
+/// History ring size baked into every live snapshot. Sized to match
+/// [`crate::DEFAULT_HISTORY_CAPACITY`] so the on-disk file is the full
+/// 256-entry ring; the CLI truncates to `--history N` on read.
+pub const DEFAULT_SNAPSHOT_HISTORY_N: usize = crate::DEFAULT_HISTORY_CAPACITY;
 
 const fn state_tag_snake(tag: StateTag) -> &'static str {
     match tag {
@@ -1383,6 +1544,94 @@ mod tests {
         assert!(
             unmute_elapsed < StdDuration::from_millis(10),
             "AC4 unmute dispatch over budget: {unmute_elapsed:?}"
+        );
+    }
+
+    /// AC6 — round-trip a [`StateSnapshot`] through serde so the CLI can
+    /// deserialise whatever the daemon writes.
+    #[test]
+    fn snapshot_serde_roundtrip() {
+        let mut fsm = Fsm::new(0);
+        let _ = fsm.handle(Event::AudioWake, 10);
+        let snap = StateSnapshot {
+            state: fsm.state().tag(),
+            flags: fsm.flags(),
+            since_ms: 20,
+            history: fsm.history(5),
+            snapshot_ms: 30,
+        };
+        let json = serde_json::to_string(&snap).expect("serialise");
+        let parsed: StateSnapshot = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(parsed, snap);
+    }
+
+    /// AC6 — [`DaemonState::snapshot`] reads the live FSM (state + flags
+    /// + history + since_ms) at the requested `now_ms`.
+    #[tokio::test]
+    async fn snapshot_reads_live_fsm_state_after_dispatch() {
+        let state = fresh_state(0);
+        let (mut timer, _rx) = fresh_timer();
+        let mut sink = MemSink::default();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 100)
+            .await
+            .expect("wake dispatch");
+
+        let snap = state.snapshot(8, 150).await;
+        assert_eq!(snap.state, StateTag::Listening);
+        assert_eq!(snap.history.len(), 1);
+        assert_eq!(snap.since_ms, 50, "150 now - 100 last_change");
+        assert_eq!(snap.snapshot_ms, 150);
+    }
+
+    /// AC6 — `write_snapshot_atomic` + `read_snapshot` round-trip
+    /// through a temp file, including parent-dir creation.
+    #[test]
+    fn snapshot_atomic_write_and_read_roundtrip() {
+        let mut fsm = Fsm::new(0);
+        let _ = fsm.handle(Event::AudioWake, 10);
+        let snap = StateSnapshot {
+            state: fsm.state().tag(),
+            flags: fsm.flags(),
+            since_ms: 5,
+            history: fsm.history(3),
+            snapshot_ms: 15,
+        };
+        let tmp_root = std::env::temp_dir().join(format!(
+            "wm-dialog-snap-test-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let path = tmp_root.join("nested").join("state.json");
+        write_snapshot_atomic(&path, &snap).expect("write");
+        let read_back = read_snapshot(&path).expect("read").expect("present");
+        assert_eq!(read_back, snap);
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    /// AC6 — `read_snapshot` returns `Ok(None)` (not `Err`) when the
+    /// file is missing, so the CLI falls back cleanly.
+    #[test]
+    fn snapshot_read_missing_file_returns_none() {
+        let path = std::env::temp_dir()
+            .join(format!("wm-dialog-missing-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let res = read_snapshot(&path).expect("ok");
+        assert!(res.is_none());
+    }
+
+    /// AC6 — `default_snapshot_path()` returns a non-empty path under
+    /// a runtime-dir-like prefix and ends in `state.json`. Avoids
+    /// mutating env vars (edition-2024 `set_var` is unsafe and the
+    /// crate forbids unsafe).
+    #[test]
+    fn snapshot_default_path_shape() {
+        let p = default_snapshot_path();
+        assert_eq!(p.file_name().and_then(|f| f.to_str()), Some("state.json"));
+        let parent = p.parent().expect("has parent");
+        assert!(
+            parent.ends_with("wm-dialog"),
+            "expected ../wm-dialog/state.json, got {}",
+            p.display()
         );
     }
 }

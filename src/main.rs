@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wintermute_dialog::daemon;
 use wintermute_dialog::state::{Flags, StateTag};
-use wintermute_dialog::{Fsm, Transition};
+use wintermute_dialog::{Fsm, StateSnapshot, Transition};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,6 +74,8 @@ enum ChildLockToggle {
 }
 
 /// JSON-stable snapshot of an [`Fsm`] returned by `wm-dialog state`.
+/// Used for the fresh-FSM fallback when the live daemon's snapshot
+/// file is missing; live reads use [`StateSnapshot`] directly.
 #[derive(Debug, Serialize)]
 struct StateReport {
     state: StateTag,
@@ -123,6 +125,49 @@ fn run_start() -> ExitCode {
 
 #[allow(clippy::print_stdout)]
 fn run_state(history: usize) -> ExitCode {
+    let snapshot_path = daemon::default_snapshot_path();
+    match daemon::read_snapshot(&snapshot_path) {
+        Ok(Some(mut snap)) => {
+            if snap.history.len() > history {
+                let start = snap.history.len().saturating_sub(history);
+                snap.history = snap.history.split_off(start);
+            }
+            print_snapshot(&snap)
+        }
+        Ok(None) => {
+            warn!(
+                path = %snapshot_path.display(),
+                "wm-dialog state: no live daemon snapshot; emitting fresh-FSM fallback"
+            );
+            print_fresh_fallback(history)
+        }
+        Err(err) => {
+            warn!(
+                path = %snapshot_path.display(),
+                err = %err,
+                "wm-dialog state: snapshot parse failed; emitting fresh-FSM fallback"
+            );
+            print_fresh_fallback(history)
+        }
+    }
+}
+
+#[allow(clippy::print_stdout)]
+fn print_snapshot(snap: &StateSnapshot) -> ExitCode {
+    match serde_json::to_string_pretty(snap) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            error!(error = %err, "wm-dialog state: failed to serialise live snapshot");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[allow(clippy::print_stdout)]
+fn print_fresh_fallback(history: usize) -> ExitCode {
     let fsm = Fsm::new(0);
     let report = StateReport {
         state: fsm.state().tag(),
@@ -133,9 +178,6 @@ fn run_state(history: usize) -> ExitCode {
     match serde_json::to_string_pretty(&report) {
         Ok(json) => {
             println!("{json}");
-            warn!(
-                "wm-dialog state: emitted fresh-FSM snapshot; live daemon query deferred to iter-4+"
-            );
             ExitCode::SUCCESS
         }
         Err(err) => {
