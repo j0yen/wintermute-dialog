@@ -1129,4 +1129,167 @@ mod tests {
         assert_eq!(state_p["prior_state"], "confirming");
         assert!(!timer.is_active(), "timeout flow cancelled the timer");
     }
+
+    // AC1 (PRD §4 #1): wake during `speaking` cancels TTS and reaches
+    // `listening` within 200 ms (measured wake-event to cancel-ack).
+    // This test pins the in-process dispatch budget: drive to Speaking,
+    // submit AudioWake, and measure wall-clock until the TTS_CANCEL +
+    // STATE pair lands on the sink. Live agorabus publish adds I/O on
+    // top, so we keep an order-of-magnitude headroom here (10 ms) to
+    // leave room for the bus round-trip the daemon will incur.
+    #[tokio::test]
+    async fn ac1_barge_in_dispatch_under_budget() {
+        let state = fresh_state(0);
+        let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
+        // Idle → Listening → Thinking → Speaking.
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::SttFinal {
+                transcript: "hi".into(),
+                confidence: 1.0,
+            },
+            30,
+        )
+        .await
+        .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::BrainReply {
+                text: "long reply".into(),
+            },
+            40,
+        )
+        .await
+        .unwrap();
+        sink.events.lock().unwrap().clear();
+
+        // Wake during speaking → measured dispatch.
+        let t0 = std::time::Instant::now();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 50)
+            .await
+            .expect("barge-in dispatch");
+        let elapsed = t0.elapsed();
+        let topics = sink.topics();
+        assert_eq!(
+            topics,
+            vec![
+                outgoing::TTS_CANCEL.to_string(),
+                outgoing::STATE.to_string(),
+            ]
+        );
+        // 10 ms cap with headroom; the real PRD budget is 200 ms
+        // wall-clock including bus I/O. If this assertion ever trips
+        // in CI the FSM dispatch path itself has regressed.
+        assert!(
+            elapsed < StdDuration::from_millis(10),
+            "AC1 barge-in dispatch over budget: {elapsed:?}"
+        );
+    }
+
+    // AC4 (PRD §4 #4): `wm-dialog mute` silences current TTS and gates
+    // wake within 200 ms; `unmute` restores both within 200 ms. The mute
+    // path during `speaking` must publish TtsCancel + AudioMute + state
+    // transition; subsequent wake while muted is gated (no transition).
+    // Same in-process budget rationale as ac1_*.
+    #[tokio::test]
+    async fn ac4_mute_dispatch_under_budget_and_gates_wake() {
+        let state = fresh_state(0);
+        let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
+        // Drive to Speaking.
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::SttFinal {
+                transcript: "hi".into(),
+                confidence: 1.0,
+            },
+            30,
+        )
+        .await
+        .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::BrainReply {
+                text: "ok".into(),
+            },
+            40,
+        )
+        .await
+        .unwrap();
+        sink.events.lock().unwrap().clear();
+
+        // Measured mute dispatch.
+        let t_mute = std::time::Instant::now();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::MuteRequest, 50)
+            .await
+            .expect("mute dispatch");
+        let mute_elapsed = t_mute.elapsed();
+        let mute_topics = sink.topics();
+        assert!(
+            mute_topics.contains(&outgoing::TTS_CANCEL.to_string()),
+            "mute did not cancel TTS: {mute_topics:?}"
+        );
+        assert!(
+            mute_topics.contains(&outgoing::AUDIO_MUTE.to_string()),
+            "mute did not publish AudioMute: {mute_topics:?}"
+        );
+        assert!(
+            mute_elapsed < StdDuration::from_millis(10),
+            "AC4 mute dispatch over budget: {mute_elapsed:?}"
+        );
+
+        // While muted, wake is gated (no transition out of Idle, no
+        // outgoing topics beyond what we already saw).
+        let topics_before_wake = mute_topics.clone();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 60)
+            .await
+            .expect("muted wake dispatch");
+        assert_eq!(
+            sink.topics(),
+            topics_before_wake,
+            "muted wake should be gated (no new topics)"
+        );
+
+        // Unmute restores; measured dispatch should land STATE on the sink.
+        let t_unmute = std::time::Instant::now();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::UnmuteRequest,
+            70,
+        )
+        .await
+        .expect("unmute dispatch");
+        let unmute_elapsed = t_unmute.elapsed();
+        assert!(
+            sink.topics().contains(&outgoing::AUDIO_UNMUTE.to_string()),
+            "unmute did not publish AudioUnmute"
+        );
+        assert!(
+            unmute_elapsed < StdDuration::from_millis(10),
+            "AC4 unmute dispatch over budget: {unmute_elapsed:?}"
+        );
+    }
 }
