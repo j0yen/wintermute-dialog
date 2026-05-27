@@ -1,0 +1,17 @@
+[Unit]
+Description=wintermute dialog (conversational FSM, turn-taker, barge-in)
+Documentation=https://github.com/j0yen/wintermute-dialog
+PartOf=wintermute.target
+After=wmd-init.service
+Wants=wmd-init.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wm-dialog start
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=15
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=wintermute.target
