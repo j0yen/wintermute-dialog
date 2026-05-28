@@ -51,15 +51,25 @@ pub trait EventSink: Send {
 }
 
 /// Production sink: publishes through an [`agorabus::Client`].
+///
+/// The client is wrapped in an `Arc<tokio::sync::Mutex<_>>` so a
+/// background heartbeat task (spawned in [`run`]) can periodically
+/// refresh the daemon's `last_heartbeat_unix_secs` without contending
+/// destructively with publish call sites. Publish is the hot path; the
+/// lock is held only for the duration of one request+reply round-trip
+/// (microseconds), so contention is negligible.
 pub struct AgoraSink {
     /// The underlying agorabus publisher client.
-    pub inner: agorabus::Client,
+    pub inner: Arc<Mutex<agorabus::Client>>,
 }
 
 #[async_trait::async_trait]
 impl EventSink for AgoraSink {
     async fn publish(&mut self, topic: &str, data: Value) -> Result<()> {
-        let reply = self.inner.publish(topic, data).await?;
+        let reply = {
+            let mut client = self.inner.lock().await;
+            client.publish(topic, data).await?
+        };
         if !reply.ok {
             warn!(
                 topic = %topic,
@@ -481,7 +491,49 @@ pub async fn run() -> Result<()> {
             "wm-dialog publish path",
         )
         .await?;
-    let mut sink = AgoraSink { inner: pub_client };
+    let pub_arc = Arc::new(Mutex::new(pub_client));
+    let mut sink = AgoraSink {
+        inner: Arc::clone(&pub_arc),
+    };
+
+    // Heartbeat keepalive — the bus daemon prunes peers from its
+    // `peers` snapshot when `last_heartbeat_unix_secs` ages past
+    // `DEFAULT_HEARTBEAT_TIMEOUT_SECS` (60s). Both the publish-owner
+    // session (`wm-dialog-{pid}`) and the subscribe-owner session
+    // (`wm-dialog-{pid}-sub`) need their own ticker, since each
+    // connection owns a distinct peer record keyed by session_id. See
+    // PRD wintermute-fleet-bus-heartbeat-keepalive §4.
+    let hb_interval = Duration::from_secs(agorabus::DEFAULT_HEARTBEAT_TIMEOUT_SECS / 2);
+    let pub_hb_arc = Arc::clone(&pub_arc);
+    let _pub_hb_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(hb_interval);
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            ticker.tick().await;
+            let mut client = pub_hb_arc.lock().await;
+            if let Err(e) = client.heartbeat("wm-dialog").await {
+                warn!(error = %e, "wm-dialog: pub heartbeat failed; bus likely gone");
+                return;
+            }
+        }
+    });
+
+    // Split sub_client into halves so the heartbeat ticker shares the
+    // wire with the reader loop. Heartbeat replies on this wire are
+    // filtered by the `InboundLine::Reply` skip in the reader arm
+    // below.
+    let (mut sub_write, mut sub_reader) = sub_client.into_halves();
+    let _sub_hb_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(hb_interval);
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            ticker.tick().await;
+            if let Err(e) = agorabus::client::send_heartbeat(&mut sub_write, "wm-dialog").await {
+                warn!(error = %e, "wm-dialog: sub heartbeat failed; bus likely gone");
+                return;
+            }
+        }
+    });
 
     let snapshot_path = default_snapshot_path();
     info!(path = %snapshot_path.display(), "wm-dialog: snapshot file");
@@ -492,26 +544,40 @@ pub async fn run() -> Result<()> {
 
     loop {
         tokio::select! {
-            next = sub_client.next_event() => {
-                match next? {
-                    None => {
+            line = sub_reader.next_line() => {
+                let line = match line {
+                    Ok(Some(l)) => l,
+                    Ok(None) => {
                         info!("wm-dialog: bus closed; daemon exiting");
                         return Ok(());
                     }
-                    Some(ev) => {
-                        match decode_request(&ev.topic, &ev.data) {
-                            Ok(request) => {
-                                let event = request_to_event(request);
-                                let now = now_unix_ms();
-                                if let Err(err) = dispatch(state.as_ref(), &mut sink, &mut timer, event, now).await {
-                                    error!(topic = %ev.topic, err = %err, "wm-dialog: dispatch failed");
-                                }
-                                write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now).await;
-                            }
-                            Err(err) => {
-                                warn!(topic = %ev.topic, err = %err, "wm-dialog: decode failed");
-                            }
+                    Err(err) => {
+                        error!(error = %err, "wm-dialog: subscribe wire read failed");
+                        return Ok(());
+                    }
+                };
+                let parsed: agorabus::client::InboundLine = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        warn!(error = %err, line = %line, "wm-dialog: undecodable bus line; skipping");
+                        continue;
+                    }
+                };
+                let ev = match parsed {
+                    agorabus::client::InboundLine::Reply(_) => continue,
+                    agorabus::client::InboundLine::Event(ev) => ev,
+                };
+                match decode_request(&ev.topic, &ev.data) {
+                    Ok(request) => {
+                        let event = request_to_event(request);
+                        let now = now_unix_ms();
+                        if let Err(err) = dispatch(state.as_ref(), &mut sink, &mut timer, event, now).await {
+                            error!(topic = %ev.topic, err = %err, "wm-dialog: dispatch failed");
                         }
+                        write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now).await;
+                    }
+                    Err(err) => {
+                        warn!(topic = %ev.topic, err = %err, "wm-dialog: decode failed");
                     }
                 }
             }
