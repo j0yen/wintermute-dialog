@@ -1,6 +1,6 @@
 [package]
 name = "wintermute-dialog"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -54,7 +54,7 @@ strip = "debuginfo"
 panic = "abort"
 
 [dependencies]
-agorabus = { path = "../agorabus" }
+agorabus = { path = "../agorabus", version = "0.3" }
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
