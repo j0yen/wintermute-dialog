@@ -451,6 +451,14 @@ pub async fn run() -> Result<()> {
         warn!(socket = %sock.display(), "wm-dialog: agorabus not reachable; exiting");
         return Ok(());
     };
+    sub_client
+        .announce(
+            &format!("wm-dialog-{}-sub", std::process::id()),
+            std::process::id(),
+            "",
+            "wm-dialog control subscribe",
+        )
+        .await?;
     for prefix in bus::SUBSCRIBE_PREFIXES {
         sub_client.subscribe(prefix).await?;
     }
@@ -459,7 +467,15 @@ pub async fn run() -> Result<()> {
         "wm-dialog: subscribed"
     );
 
-    let pub_client = agorabus::Client::connect(&sock).await?;
+    let mut pub_client = agorabus::Client::connect(&sock).await?;
+    pub_client
+        .announce(
+            &format!("wm-dialog-{}", std::process::id()),
+            std::process::id(),
+            "",
+            "wm-dialog publish path",
+        )
+        .await?;
     let mut sink = AgoraSink { inner: pub_client };
 
     let snapshot_path = default_snapshot_path();
