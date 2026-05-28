@@ -446,7 +446,12 @@ pub async fn run() -> Result<()> {
     let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<Event>();
     let mut timer = ConfirmTimer::new(timer_tx);
 
-    let sock = agorabus::default_socket_path();
+    // `WM_DIALOG_BUS_SOCKET` override mirrors `wm-stt`'s `WM_STT_BUS_SOCKET`
+    // / `wm-tts`'s `WM_TTS_BUS_SOCKET` idiom and lets `tests/bus_smoke.rs`
+    // point the daemon at a per-test temp socket without touching $HOME.
+    let sock = std::env::var("WM_DIALOG_BUS_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| agorabus::default_socket_path());
     let Some(mut sub_client) = agorabus::Client::try_connect(&sock).await? else {
         warn!(socket = %sock.display(), "wm-dialog: agorabus not reachable; exiting");
         return Ok(());
