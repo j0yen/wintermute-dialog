@@ -106,6 +106,28 @@ Published: `wm.dialog.state`, `wm.dialog.turn.user`,
 `wm.dialog.tts.speak`, `wm.dialog.tts.cancel`,
 `wm.dialog.audio.{mute,unmute}`, `wm.dialog.confirm.{granted,denied}`.
 
+## Hardware reality verification
+
+ACs 1 and 4 are audio-path-bound (wake-event-to-cancel-ack within 200 ms,
+mute/unmute silencing and restoring current TTS within 200 ms). Both
+budgets are dominated by real TTS cancellation and audio-sink gating
+round-trip latency through the live Piper/PipeWire output path. They are
+declared in the PRD's `deferred_acs:` + `mock_unjustified_for:`
+frontmatter with a one-sentence justification each, because an in-process
+FSM mock would time our transition bookkeeping rather than the physical
+audio path the AC bounds.
+
+To validate them against real hardware, run:
+
+```sh
+cargo test --features=real-hardware
+```
+
+This feature is opt-in and off by default, so `cargo test` stays green on
+hosts without the live Piper/PipeWire audio path. The drift-report sweep
+that compares mock vs. real-hardware outcomes (`hardware-drift.json`) is
+scaffolded as a follow-on PRD and is not invoked by default.
+
 ## License
 
 Dual-licensed MIT or Apache-2.0 at your option.
