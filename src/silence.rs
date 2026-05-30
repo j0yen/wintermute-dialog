@@ -50,7 +50,7 @@ const CLOSE_PHRASE: &str = "I'll be right here when you need me.";
 #[must_use]
 pub fn silence_reprompt(attempt: usize) -> &'static str {
     let idx = attempt.min(REPROMPT_PHRASES.len().saturating_sub(1));
-    REPROMPT_PHRASES[idx]
+    REPROMPT_PHRASES.get(idx).copied().unwrap_or(CLOSE_PHRASE)
 }
 
 /// Return the warm close phrase spoken before the FSM transitions to
@@ -73,12 +73,18 @@ mod tests {
 
     #[test]
     fn reprompt_attempt_0_first_phrase() {
-        assert_eq!(silence_reprompt(0), REPROMPT_PHRASES[0]);
+        assert_eq!(
+            silence_reprompt(0),
+            *REPROMPT_PHRASES.first().expect("non-empty")
+        );
     }
 
     #[test]
     fn reprompt_attempt_1_second_phrase() {
-        assert_eq!(silence_reprompt(1), REPROMPT_PHRASES[1]);
+        assert_eq!(
+            silence_reprompt(1),
+            *REPROMPT_PHRASES.get(1).expect("at least 2 phrases")
+        );
     }
 
     #[test]
