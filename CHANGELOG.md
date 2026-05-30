@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.0 — 2026-05-30
+
+Add DegradeBank with per-kind rotating cursors to wintermute-dialog.
+SttUncertain, TranscribeTimeout, BrainError, and ThinkTimeout each get
+distinct phrase sets; consecutive failures of the same kind vary output
+via round-robin rotation. Preserves backward-compat free functions and
+the legacy "didn't catch" AC6 contract. +16 tests.
+
 ## v0.5.0 — 2026-05-30
 
 Adds deterministic distress fast-path to wintermute-dialog (family-distress PRD).
