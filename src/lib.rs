@@ -25,6 +25,7 @@ pub mod action;
 pub mod bus;
 pub mod config;
 pub mod daemon;
+pub mod degrade;
 pub mod event;
 pub mod family;
 pub mod fsm;

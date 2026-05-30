@@ -322,7 +322,18 @@ pub const fn topic_for_action(action: &Action) -> Option<&'static str> {
         Action::PublishTtsCancel => Some(outgoing::TTS_CANCEL),
         Action::PublishTtsSay { .. } => Some(outgoing::TTS_SPEAK),
         Action::PublishBrainUtterance { .. } => Some(outgoing::BRAIN_UTTERANCE),
-        Action::StartConfirmTimer { .. } | Action::CancelConfirmTimer => None,
+        Action::PublishDialogAttention => Some(outgoing::DIALOG_ATTENTION),
+        Action::PublishDialogHeard { .. } => Some(outgoing::DIALOG_HEARD),
+        Action::PublishDialogUnheard => Some(outgoing::DIALOG_UNHEARD),
+        Action::PublishDialogTimeout => Some(outgoing::DIALOG_TIMEOUT),
+        Action::StartConfirmTimer { .. }
+        | Action::CancelConfirmTimer
+        | Action::StartCaptureTimer { .. }
+        | Action::CancelCaptureTimer
+        | Action::StartTranscribeTimer { .. }
+        | Action::CancelTranscribeTimer
+        | Action::StartThinkTimer { .. }
+        | Action::CancelThinkTimer => None,
     }
 }
 
@@ -387,7 +398,18 @@ pub fn action_to_value(action: &Action, ts: u64) -> Result<Option<Value>> {
             "confidence": confidence,
             "ts": ts,
         })),
-        Action::StartConfirmTimer { .. } | Action::CancelConfirmTimer => None,
+        Action::PublishDialogAttention => Some(json!({ "ts": ts })),
+        Action::PublishDialogHeard { text } => Some(json!({ "text": text, "ts": ts })),
+        Action::PublishDialogUnheard => Some(json!({ "ts": ts })),
+        Action::PublishDialogTimeout => Some(json!({ "ts": ts })),
+        Action::StartConfirmTimer { .. }
+        | Action::CancelConfirmTimer
+        | Action::StartCaptureTimer { .. }
+        | Action::CancelCaptureTimer
+        | Action::StartTranscribeTimer { .. }
+        | Action::CancelTranscribeTimer
+        | Action::StartThinkTimer { .. }
+        | Action::CancelThinkTimer => None,
     })
 }
 
@@ -891,7 +913,16 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 100)
             .await
             .expect("dispatch ok");
-        assert_eq!(sink.topics(), vec![outgoing::STATE.to_string()]);
+        // turn-fsm: wake now also publishes wm.dialog.attention before state.
+        let topics = sink.topics();
+        assert!(
+            topics.contains(&outgoing::DIALOG_ATTENTION.to_string()),
+            "wake must publish wm.dialog.attention; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::STATE.to_string()),
+            "wake must publish wm.dialog.state; got {topics:?}"
+        );
         let p = sink.payload(outgoing::STATE);
         assert_eq!(p["prior_state"], "idle");
         assert_eq!(p["state"], "listening");
@@ -924,13 +955,22 @@ mod tests {
         .await
         .expect("stt final");
         let topics = sink.topics();
-        assert_eq!(
-            topics,
-            vec![
-                outgoing::TURN_USER.to_string(),
-                outgoing::BRAIN_UTTERANCE.to_string(),
-                outgoing::STATE.to_string(),
-            ]
+        // turn-fsm: stt.final now also emits wm.dialog.heard.
+        assert!(
+            topics.contains(&outgoing::TURN_USER.to_string()),
+            "must publish turn.user; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::BRAIN_UTTERANCE.to_string()),
+            "must publish brain.utterance; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::DIALOG_HEARD.to_string()),
+            "turn-fsm: must publish wm.dialog.heard; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::STATE.to_string()),
+            "must publish state; got {topics:?}"
         );
         let turn_user = sink.payload(outgoing::TURN_USER);
         assert_eq!(turn_user["transcript"], "what time is it");
@@ -941,6 +981,8 @@ mod tests {
             (conf - f64::from(0.91_f32)).abs() < 1e-6,
             "confidence ≈ 0.91 ({conf})"
         );
+        let heard = sink.payload(outgoing::DIALOG_HEARD);
+        assert_eq!(heard["text"], "what time is it");
         let state_p = sink.payload(outgoing::STATE);
         assert_eq!(state_p["state"], "thinking");
     }
@@ -1039,12 +1081,18 @@ mod tests {
             .await
             .expect("barge-in");
         let topics = sink.topics();
-        assert_eq!(
-            topics,
-            vec![
-                outgoing::TTS_CANCEL.to_string(),
-                outgoing::STATE.to_string(),
-            ]
+        // turn-fsm: barge-in now also publishes wm.dialog.attention.
+        assert!(
+            topics.contains(&outgoing::TTS_CANCEL.to_string()),
+            "barge-in must cancel TTS; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::DIALOG_ATTENTION.to_string()),
+            "barge-in must publish attention; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::STATE.to_string()),
+            "barge-in must publish state; got {topics:?}"
         );
         let state_p = sink.payload(outgoing::STATE);
         assert_eq!(state_p["state"], "listening");
@@ -1538,12 +1586,18 @@ mod tests {
             .expect("barge-in dispatch");
         let elapsed = t0.elapsed();
         let topics = sink.topics();
-        assert_eq!(
-            topics,
-            vec![
-                outgoing::TTS_CANCEL.to_string(),
-                outgoing::STATE.to_string(),
-            ]
+        // turn-fsm: barge-in now also publishes wm.dialog.attention before state.
+        assert!(
+            topics.contains(&outgoing::TTS_CANCEL.to_string()),
+            "AC1 barge-in must cancel TTS; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::DIALOG_ATTENTION.to_string()),
+            "AC1 turn-fsm: barge-in must publish attention; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::STATE.to_string()),
+            "AC1 barge-in must publish state; got {topics:?}"
         );
         // 10 ms cap with headroom; the real PRD budget is 200 ms
         // wall-clock including bus I/O. If this assertion ever trips

@@ -72,6 +72,14 @@ pub mod outgoing {
     pub const AUDIO_MUTE: &str = "wm.audio.mute";
     /// Release the audio capture mute gate (matches `wintermute-audio::Topics::UNMUTE`).
     pub const AUDIO_UNMUTE: &str = "wm.audio.unmute";
+    /// Wake detected; FSM is now armed to capture speech. UI hook.
+    pub const DIALOG_ATTENTION: &str = "wm.dialog.attention";
+    /// STT final forwarded to brain; emitted with transcript text.
+    pub const DIALOG_HEARD: &str = "wm.dialog.heard";
+    /// STT uncertain or transcribe timeout; no usable utterance.
+    pub const DIALOG_UNHEARD: &str = "wm.dialog.unheard";
+    /// A state-machine deadline elapsed; FSM returned to Idle.
+    pub const DIALOG_TIMEOUT: &str = "wm.dialog.timeout";
 }
 
 /// Decoded request payloads. Returned by [`decode_request`].

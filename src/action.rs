@@ -71,6 +71,45 @@ pub enum Action {
     },
     /// Cancel any in-flight confirm-timeout timer.
     CancelConfirmTimer,
+    /// Publish `wm.dialog.attention` — wake was detected, FSM is
+    /// now listening for speech. UI hook (LED, sound, etc.).
+    PublishDialogAttention,
+    /// Publish `wm.dialog.heard` — STT final transcript was forwarded
+    /// to the brain. Carries the transcript text for observers.
+    PublishDialogHeard {
+        /// The recognised utterance text.
+        text: String,
+    },
+    /// Publish `wm.dialog.unheard` — STT was uncertain or timed out;
+    /// FSM is returning to Idle after a degrade phrase.
+    PublishDialogUnheard,
+    /// Publish `wm.dialog.timeout` — a state-machine deadline elapsed
+    /// (capture 8s, transcribe 3s, or think 10s); FSM returns to Idle.
+    PublishDialogTimeout,
+    /// Start (or restart) the capture-timeout timer (PRD §2.1: 8s after
+    /// wake, reset to Idle if no speech arrives).
+    StartCaptureTimer {
+        /// Timeout in milliseconds.
+        ms: u32,
+    },
+    /// Cancel any in-flight capture-timeout timer.
+    CancelCaptureTimer,
+    /// Start (or restart) the transcribe-timeout timer (PRD §2.1: 3s
+    /// after speech-end, reset to Idle if no STT result arrives).
+    StartTranscribeTimer {
+        /// Timeout in milliseconds.
+        ms: u32,
+    },
+    /// Cancel any in-flight transcribe-timeout timer.
+    CancelTranscribeTimer,
+    /// Start (or restart) the think-timeout timer (PRD §2.1: 10s
+    /// after brain forward, emit degrade phrase and reset to Idle).
+    StartThinkTimer {
+        /// Timeout in milliseconds.
+        ms: u32,
+    },
+    /// Cancel any in-flight think-timeout timer.
+    CancelThinkTimer,
 }
 
 /// Why a verbal-confirm flow ended in deny.
