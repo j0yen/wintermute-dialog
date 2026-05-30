@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.0 — 2026-05-30
+
+Adds wm.family.* topic contract and family-intent matcher to wintermute-dialog.
+Defines four topic constants (TOPIC_FAMILY_MESSAGE/DISTRESS/ACK/REPLY), the
+FamilyMessage/FamilyAck/FamilyReply envelope types, a deterministic API-independent
+intent matcher (tell/message/let know/call + enrolled-name matching), and
+FamilyFsm for the pending-ack wait with timeout and inbound-reply routing.
+Also fixes pre-existing clippy lints (indexing_slicing in silence.rs,
+as_conversions in fsm.rs) and updates agorabus dep to 0.8.
+
 ## v0.3.0 — 2026-05-29
 
 earshot-gentle-reprompt: patient, spoken, more-than-once silence path.
