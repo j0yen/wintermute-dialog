@@ -128,6 +128,14 @@ hosts without the live Piper/PipeWire audio path. The drift-report sweep
 that compares mock vs. real-hardware outcomes (`hardware-drift.json`) is
 scaffolded as a follow-on PRD and is not invoked by default.
 
+## Recent
+
+- **v0.3.0** — `wm.family.*` topic contract + family-intent matcher. Adds
+  `src/family.rs` with four topic constants, `FamilyMessage`/`FamilyAck`/
+  `FamilyReply` serde types, deterministic `match_family_intent()` (no Claude API),
+  and `FamilyFsm` for the pending-ack wait, ack-timeout, and inbound-reply TTS
+  routing. Also fixes agorabus dependency to 0.8 and pre-existing clippy lints.
+
 ## License
 
 Dual-licensed MIT or Apache-2.0 at your option.
