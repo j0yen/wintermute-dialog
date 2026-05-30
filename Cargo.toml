@@ -2,7 +2,7 @@
 name = "wintermute-dialog"
 version = "0.1.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -61,7 +61,7 @@ strip = "debuginfo"
 panic = "abort"
 
 [dependencies]
-agorabus = { path = "../agorabus", version = "0.3" }
+agorabus = { path = "../agorabus", version = "0.6" }
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
@@ -74,3 +74,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 proptest = "1"
+toml = "0.8"

@@ -12,23 +12,35 @@
 //! capacity is [`DEFAULT_HISTORY_CAPACITY`] (PRD §2.5 / intent-card
 //! `history_ring_size` = 256). [`Fsm::history`] returns the last `N`
 //! in chronological order (oldest → newest).
+//!
+//! Timing constants are now **configuration-sourced** (earshot-dialog-timing):
+//! the FSM stores a [`crate::config::DialogTimingConfig`] and reads
+//! deadlines from it at runtime.  The compile-time constants
+//! [`CONFIRM_TIMEOUT_MS`] and [`MAX_REPROMPTS`] are kept for
+//! backward-compatibility and as the `Default` source-of-truth reference,
+//! but the transition code no longer reads them directly.
 
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
 use crate::action::{Action, DenyReason};
+use crate::config::DialogTimingConfig;
 use crate::event::{Event, EventTag};
 use crate::state::{ConfirmContext, Flags, State, StateTag};
 
 /// Default history-ring capacity. PRD §2.5 / intent-card `history_ring_size`.
 pub const DEFAULT_HISTORY_CAPACITY: usize = 256;
 
-/// PRD §2.4: verbal-confirm timeout (30 s → `30_000` ms).
-pub const CONFIRM_TIMEOUT_MS: u32 = 30_000;
+/// Compile-time reference value for the verbal-confirm timeout (30 s).
+/// Kept for backward-compatibility; the FSM reads the runtime value from
+/// [`DialogTimingConfig::confirm_timeout_ms`].
+pub const CONFIRM_TIMEOUT_MS: u32 = crate::config::LEGACY_CONFIRM_TIMEOUT_MS;
 
-/// PRD §2.4: at most one re-prompt before deny.
-pub const MAX_REPROMPTS: u8 = 1;
+/// Compile-time reference value for the maximum re-prompt count.
+/// Kept for backward-compatibility; the FSM reads the runtime value from
+/// [`DialogTimingConfig::max_reprompts`].
+pub const MAX_REPROMPTS: u8 = crate::config::LEGACY_MAX_REPROMPTS;
 
 /// One historical transition entry. Returned by [`Fsm::history`] and
 /// the (future) `wm-dialog state --history N` CLI surface.
@@ -54,14 +66,25 @@ pub struct Fsm {
     last_change_ms: u64,
     history: VecDeque<Transition>,
     history_cap: usize,
+    /// Runtime timing configuration. All deadline values are read from
+    /// here; no hard-coded constants remain in the transition code.
+    timing: DialogTimingConfig,
 }
 
 impl Fsm {
-    /// Construct a fresh FSM in `Idle` with default flags + default
-    /// history capacity. `now_ms` is the FSM's epoch — `since_ms`
-    /// values are computed against this until the first transition.
+    /// Construct a fresh FSM in `Idle` with default flags, default
+    /// history capacity, and **elder-friendly** timing defaults.
+    /// `now_ms` is the FSM's epoch — `since_ms` values are computed
+    /// against this until the first transition.
     #[must_use]
-    pub const fn new(now_ms: u64) -> Self {
+    pub fn new(now_ms: u64) -> Self {
+        Self::with_timing(now_ms, DialogTimingConfig::default())
+    }
+
+    /// Construct an FSM with explicit timing configuration.  Use this
+    /// when loading timing from a `[timing]` config table.
+    #[must_use]
+    pub const fn with_timing(now_ms: u64, timing: DialogTimingConfig) -> Self {
         Self {
             state: State::Idle,
             flags: Flags {
@@ -71,15 +94,36 @@ impl Fsm {
             last_change_ms: now_ms,
             history: VecDeque::new(),
             history_cap: DEFAULT_HISTORY_CAPACITY,
+            timing,
         }
     }
 
-    /// Construct an FSM with a non-default history capacity.
+    /// Construct an FSM with a non-default history capacity and
+    /// elder-friendly timing defaults.
     #[must_use]
     pub fn with_history_capacity(now_ms: u64, cap: usize) -> Self {
         let mut fsm = Self::new(now_ms);
         fsm.history_cap = cap.max(1);
         fsm
+    }
+
+    /// Construct an FSM with both a non-default history capacity and
+    /// explicit timing configuration.
+    #[must_use]
+    pub fn with_history_capacity_and_timing(
+        now_ms: u64,
+        cap: usize,
+        timing: DialogTimingConfig,
+    ) -> Self {
+        let mut fsm = Self::with_timing(now_ms, timing);
+        fsm.history_cap = cap.max(1);
+        fsm
+    }
+
+    /// Borrow the timing configuration this FSM was constructed with.
+    #[must_use]
+    pub const fn timing(&self) -> &DialogTimingConfig {
+        &self.timing
     }
 
     /// Borrow the current state node.
@@ -356,11 +400,11 @@ impl Fsm {
             confirm_keyword,
             attempts: 0,
         });
+        // Read deadline from config — no magic constant in transition code.
+        let confirm_ms = self.timing.confirm_timeout_ms;
         let mut acts = vec![
             Action::PublishTtsSay { text: prompt },
-            Action::StartConfirmTimer {
-                ms: CONFIRM_TIMEOUT_MS,
-            },
+            Action::StartConfirmTimer { ms: confirm_ms },
         ];
         acts.extend(self.transition_to(next, EventTag::BrainReplyDestructive, now_ms));
         acts
@@ -372,7 +416,9 @@ impl Fsm {
         transcript: &str,
         now_ms: u64,
     ) -> Vec<Action> {
-        match classify_confirm(transcript, &ctx.confirm_keyword, ctx.attempts) {
+        // Read max_reprompts from config — no magic constant in transition code.
+        let max_reprompts = self.timing.max_reprompts;
+        match classify_confirm(transcript, &ctx.confirm_keyword, ctx.attempts, max_reprompts) {
             ConfirmDecision::Grant => {
                 let intent_id = ctx.intent_id;
                 let mut acts = vec![
@@ -410,13 +456,13 @@ impl Fsm {
                     ..ctx
                 };
                 self.state = State::Confirming(new_ctx);
+                // Read deadline from config — no magic constant.
+                let confirm_ms = self.timing.confirm_timeout_ms;
                 vec![
                     Action::PublishTtsSay {
                         text: reprompt_text,
                     },
-                    Action::StartConfirmTimer {
-                        ms: CONFIRM_TIMEOUT_MS,
-                    },
+                    Action::StartConfirmTimer { ms: confirm_ms },
                 ]
             }
         }
@@ -433,13 +479,21 @@ enum ConfirmDecision {
 
 /// PRD §2.4 verbal-confirm match table.
 ///
-/// `attempts == 0` allows one re-prompt; `attempts >= MAX_REPROMPTS`
-/// folds the re-prompt slot into a deny on ambiguity.
-fn classify_confirm(transcript: &str, keyword: &str, attempts: u8) -> ConfirmDecision {
+/// `attempts == 0` allows re-prompts up to `max_reprompts`; once
+/// `attempts >= max_reprompts` any ambiguous response folds into a deny.
+/// The `max_reprompts` parameter is now sourced from
+/// [`DialogTimingConfig::max_reprompts`] rather than a compile-time
+/// constant so the operator can tune the threshold without recompiling.
+fn classify_confirm(
+    transcript: &str,
+    keyword: &str,
+    attempts: u8,
+    max_reprompts: u8,
+) -> ConfirmDecision {
     let lower = transcript.trim().to_lowercase();
     let keyword_lower = keyword.trim().to_lowercase();
     if lower.is_empty() {
-        return if attempts >= MAX_REPROMPTS {
+        return if attempts >= max_reprompts {
             ConfirmDecision::Deny(DenyReason::Ambiguous)
         } else {
             ConfirmDecision::Reprompt
@@ -462,18 +516,18 @@ fn classify_confirm(transcript: &str, keyword: &str, attempts: u8) -> ConfirmDec
         return ConfirmDecision::Grant;
     }
 
-    // After one re-prompt, accept the bare keyword too — the prompt
+    // After enough re-prompts, accept the bare keyword too — the prompt
     // explicitly asked for it.
-    if attempts >= MAX_REPROMPTS && lower == keyword_lower {
+    if attempts >= max_reprompts && lower == keyword_lower {
         return ConfirmDecision::Grant;
     }
 
     let yes_alone = parts.len() == 1 && parts.first().is_some_and(|p| *p == "yes");
-    if yes_alone && attempts < MAX_REPROMPTS {
+    if yes_alone && attempts < max_reprompts {
         return ConfirmDecision::Reprompt;
     }
 
-    if attempts >= MAX_REPROMPTS {
+    if attempts >= max_reprompts {
         ConfirmDecision::Deny(DenyReason::Ambiguous)
     } else {
         ConfirmDecision::Reprompt
@@ -621,9 +675,20 @@ mod tests {
         assert!(acts.contains(&Action::CancelConfirmTimer));
     }
 
+    /// Verify that the FSM grants when the bare keyword is said after
+    /// `max_reprompts` have been exhausted.  Uses `max_reprompts = 1`
+    /// explicitly so the bare-keyword grant fires after exactly one
+    /// re-prompt, and asserts that `StartConfirmTimer { ms }` carries
+    /// the config-sourced value rather than the compile-time constant.
     #[test]
     fn confirm_grants_after_yes_alone_then_keyword() {
-        let mut fsm = Fsm::new(0);
+        use crate::config::DialogTimingConfig;
+        let timing = DialogTimingConfig {
+            max_reprompts: 1,
+            ..DialogTimingConfig::default()
+        };
+        let mut fsm = Fsm::with_timing(0, timing);
+        let expected_confirm_ms = fsm.timing().confirm_timeout_ms;
         drive_to_confirming(&mut fsm, "delete-email");
         let acts1 = fsm.handle(
             Event::SttFinal {
@@ -632,15 +697,18 @@ mod tests {
             },
             700,
         );
-        // Stays confirming, emits re-prompt + restarts timer.
+        // Stays confirming (attempts=0 < max_reprompts=1), emits re-prompt
+        // + restarts timer with the config-sourced ms value.
         assert_state(&fsm, StateTag::Confirming);
         assert!(acts1
             .iter()
             .any(|a| matches!(a, Action::PublishTtsSay { .. })));
+        // Timer restart uses the config-sourced value, not the compile-time const.
         assert!(acts1.iter().any(|a| matches!(
             a,
-            Action::StartConfirmTimer { ms } if *ms == CONFIRM_TIMEOUT_MS
+            Action::StartConfirmTimer { ms } if *ms == expected_confirm_ms
         )));
+        // Now attempts=1 >= max_reprompts=1; bare keyword → Grant.
         let acts2 = fsm.handle(
             Event::SttFinal {
                 transcript: "delete-email".to_string(),
@@ -695,9 +763,52 @@ mod tests {
         )));
     }
 
+    /// Verify that the FSM denies on ambiguity once `max_reprompts`
+    /// attempts have been exhausted.  This test uses an explicit
+    /// `max_reprompts = 1` config so it exercises the "one re-prompt"
+    /// boundary regardless of the elder-friendly default (2).
     #[test]
-    fn confirm_denies_on_ambiguous_after_one_reprompt() {
-        let mut fsm = Fsm::new(0);
+    fn confirm_denies_on_ambiguous_after_configured_reprompts() {
+        use crate::config::DialogTimingConfig;
+        let timing = DialogTimingConfig {
+            max_reprompts: 1,
+            ..DialogTimingConfig::default()
+        };
+        let mut fsm = Fsm::with_timing(0, timing);
+        drive_to_confirming(&mut fsm, "delete-email");
+        // First ambiguous → re-prompt (attempts=0 < max_reprompts=1).
+        fsm.handle(
+            Event::SttFinal {
+                transcript: "what?".to_string(),
+                confidence: 0.9,
+            },
+            700,
+        );
+        assert_state(&fsm, StateTag::Confirming);
+        // Second ambiguous → deny (attempts=1 >= max_reprompts=1).
+        let acts = fsm.handle(
+            Event::SttFinal {
+                transcript: "yeah maybe".to_string(),
+                confidence: 0.9,
+            },
+            800,
+        );
+        assert_state(&fsm, StateTag::Idle);
+        assert!(acts.iter().any(|a| matches!(
+            a,
+            Action::PublishConfirmDenied {
+                reason: DenyReason::Ambiguous,
+                ..
+            }
+        )));
+    }
+
+    /// With the elder-friendly default (max_reprompts=2), a second
+    /// ambiguous utterance still gives another re-prompt rather than
+    /// denying immediately.
+    #[test]
+    fn confirm_reprompts_twice_with_default_config() {
+        let mut fsm = Fsm::new(0); // elder-friendly defaults: max_reprompts=2
         drive_to_confirming(&mut fsm, "delete-email");
         // First ambiguous → re-prompt.
         fsm.handle(
@@ -708,16 +819,29 @@ mod tests {
             700,
         );
         assert_state(&fsm, StateTag::Confirming);
-        // Second ambiguous → deny.
-        let acts = fsm.handle(
+        // Second ambiguous → re-prompt again (attempts=1 < max_reprompts=2).
+        let acts2 = fsm.handle(
             Event::SttFinal {
-                transcript: "yeah maybe".to_string(),
+                transcript: "hmm?".to_string(),
                 confidence: 0.9,
             },
             800,
         );
+        assert_state(&fsm, StateTag::Confirming);
+        assert!(
+            acts2.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "second ambiguous should re-prompt with max_reprompts=2"
+        );
+        // Third ambiguous → deny (attempts=2 >= max_reprompts=2).
+        let acts3 = fsm.handle(
+            Event::SttFinal {
+                transcript: "yeah maybe".to_string(),
+                confidence: 0.9,
+            },
+            900,
+        );
         assert_state(&fsm, StateTag::Idle);
-        assert!(acts.iter().any(|a| matches!(
+        assert!(acts3.iter().any(|a| matches!(
             a,
             Action::PublishConfirmDenied {
                 reason: DenyReason::Ambiguous,
@@ -818,6 +942,85 @@ mod tests {
         // Each entry has elapsed_ms = at_ms - prior at_ms (monotonic).
         for w in last3.windows(2) {
             assert!(w[1].at_ms >= w[0].at_ms);
+        }
+    }
+
+    /// AC3 / AC4: a non-default `confirm_timeout_ms` value is reflected in
+    /// the `StartConfirmTimer { ms }` action emitted when the FSM enters
+    /// `Confirming`.  This test uses `confirm_timeout_ms = 12_000` and
+    /// asserts that the timer action carries 12_000, not the legacy 30_000
+    /// or the elder-friendly default 45_000.
+    #[test]
+    fn custom_confirm_ms_schedules_correct_timer() {
+        use crate::config::DialogTimingConfig;
+        let custom_ms: u32 = 12_000;
+        let timing = DialogTimingConfig {
+            confirm_timeout_ms: custom_ms,
+            ..DialogTimingConfig::default()
+        };
+        let mut fsm = Fsm::with_timing(0, timing);
+        drive_to_thinking(&mut fsm);
+        let acts = fsm.handle(
+            Event::BrainReplyDestructive {
+                intent_id: "i-custom".to_string(),
+                summary: "do the thing".to_string(),
+                confirm_keyword: "do-it".to_string(),
+            },
+            500,
+        );
+        assert_state(&fsm, StateTag::Confirming);
+        let timer_ms = acts
+            .iter()
+            .find_map(|a| {
+                if let Action::StartConfirmTimer { ms } = a {
+                    Some(*ms)
+                } else {
+                    None
+                }
+            })
+            .expect("StartConfirmTimer action must be present");
+        assert_eq!(
+            timer_ms, custom_ms,
+            "StartConfirmTimer {{ms}} should use config value {custom_ms}, got {timer_ms}"
+        );
+    }
+
+    /// AC3: verify that no timing magic numbers remain — the FSM reads
+    /// `confirm_timeout_ms` from its `timing` field.  Changing the config
+    /// changes the scheduled ms, demonstrating the transition code is
+    /// config-sourced.
+    #[test]
+    fn timing_field_drives_all_confirm_timer_schedules() {
+        use crate::config::DialogTimingConfig;
+        for confirm_ms in [5_000_u32, 30_000, 45_000, 90_000] {
+            let timing = DialogTimingConfig {
+                confirm_timeout_ms: confirm_ms,
+                ..DialogTimingConfig::default()
+            };
+            let mut fsm = Fsm::with_timing(0, timing);
+            drive_to_thinking(&mut fsm);
+            let acts = fsm.handle(
+                Event::BrainReplyDestructive {
+                    intent_id: "i-sweep".to_string(),
+                    summary: "do something destructive".to_string(),
+                    confirm_keyword: "confirm-it".to_string(),
+                },
+                500,
+            );
+            let scheduled = acts
+                .iter()
+                .find_map(|a| {
+                    if let Action::StartConfirmTimer { ms } = a {
+                        Some(*ms)
+                    } else {
+                        None
+                    }
+                })
+                .expect("StartConfirmTimer must appear");
+            assert_eq!(
+                scheduled, confirm_ms,
+                "config confirm_ms={confirm_ms} → timer ms should be {confirm_ms}, got {scheduled}"
+            );
         }
     }
 

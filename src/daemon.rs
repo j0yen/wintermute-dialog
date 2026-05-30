@@ -449,6 +449,8 @@ pub fn fresh_state(now_ms: u64) -> Arc<DaemonState> {
 /// `wm-stt` / `wm-tts`).
 #[allow(
     clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    clippy::map_unwrap_or,
     reason = "single subscribe-loop with explicit error logging branches; splitting hurts readability"
 )]
 pub async fn run() -> Result<()> {
