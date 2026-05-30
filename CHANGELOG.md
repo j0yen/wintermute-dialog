@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.0 — 2026-05-30
+
+## wintermute-dialog-turn-fsm
+
+Ships the complete PRD turn-taking FSM transitions:
+
+- New `degrade.rs` phrase bank for heard-nothing and think-error paths
+- New timeout events: `CaptureTimeout` (8s), `TranscribeTimeout` (3s), `ThinkTimeout` (10s)
+- New `BrainError` event routes through degrade-think-error phrases
+- New actions: `PublishDialogAttention`, `PublishDialogHeard`, `PublishDialogUnheard`, `PublishDialogTimeout` + capture/transcribe/think timer arms
+- `SttUncertain` now correctly returns FSM to Idle (not Listening) with degrade
+- Barge-in from Speaking now emits attention signal + arms capture timer
+- 95 lib tests pass (+16 net, exceeds AC1 requirement of +10)
+
 ## v0.3.0 — 2026-05-30
 
 Adds wm.family.* topic contract and family-intent matcher to wintermute-dialog.
