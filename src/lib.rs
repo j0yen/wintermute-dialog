@@ -26,6 +26,7 @@ pub mod bus;
 pub mod config;
 pub mod daemon;
 pub mod degrade;
+pub mod distress;
 pub mod event;
 pub mod family;
 pub mod fsm;
@@ -37,6 +38,10 @@ pub use config::DialogTimingConfig;
 pub use daemon::{
     DEFAULT_SNAPSHOT_HISTORY_N, StateSnapshot, default_snapshot_path, read_snapshot,
     write_snapshot_atomic,
+};
+pub use distress::{
+    DistressAction, DistressFsm, DistressState, FamilyDistress, Severity, classify,
+    distress_assurance, distress_failure_phrase, distress_soft_declined, distress_soft_prompt,
 };
 pub use event::{Event, EventTag};
 pub use family::{
