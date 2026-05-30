@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.0 — 2026-05-30
+
+Lift the FSM's timing constants into a `[timing]` config table (`DialogTimingConfig`) with elder-friendly defaults: `confirm_timeout_ms = 45_000` (was 30 s) and `max_reprompts = 2` (was 1). The FSM and daemon read all deadlines from the runtime config; no timing magic numbers remain in transition code. Absent `[timing]` table → elder-friendly defaults, so existing deployments need no config edits.
+
 ## v0.1.1 — 2026-05-28
 
 Fix post-announce bus-startup defect (PRD-wintermute-fleet-bus-startup-defect).
