@@ -19,6 +19,13 @@
 //! [`CONFIRM_TIMEOUT_MS`] and [`MAX_REPROMPTS`] are kept for
 //! backward-compatibility and as the `Default` source-of-truth reference,
 //! but the transition code no longer reads them directly.
+//!
+//! earshot-gentle-reprompt: `ConfirmTimeout` now drives a multi-attempt
+//! patience sequence before returning to Idle.  Each intermediate timeout
+//! emits a warm check-in phrase (from [`crate::silence`]) and restarts
+//! the confirm timer.  The final timeout emits a spoken close line before
+//! the `Confirming → Idle` transition so the return-to-idle is announced,
+//! not silent.
 
 use std::collections::VecDeque;
 
@@ -27,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::action::{Action, DenyReason};
 use crate::config::DialogTimingConfig;
 use crate::event::{Event, EventTag};
+use crate::silence::{silence_close, silence_reprompt};
 use crate::state::{ConfirmContext, Flags, State, StateTag};
 
 /// Default history-ring capacity. PRD §2.5 / intent-card `history_ring_size`.
@@ -278,20 +286,47 @@ impl Fsm {
                 },
             ) => self.handle_confirm_utterance(ctx.clone(), &transcript, now_ms),
             (State::Confirming(ctx), Event::ConfirmTimeout) => {
-                let intent_id = ctx.intent_id.clone();
-                let mut acts = vec![
-                    Action::CancelConfirmTimer,
-                    Action::PublishConfirmDenied {
-                        intent_id,
-                        reason: DenyReason::Silence,
-                    },
-                ];
-                acts.extend(self.transition_to(
-                    State::Idle,
-                    EventTag::ConfirmTimeout,
-                    now_ms,
-                ));
-                acts
+                let max_reprompts = self.timing.max_reprompts;
+                let attempts = ctx.attempts;
+                if attempts < max_reprompts {
+                    // Patience reprompt: emit a warm check-in phrase,
+                    // bump the attempt counter, restart the timer — stay
+                    // in Confirming without a state transition.
+                    let phrase = silence_reprompt(attempts as usize);
+                    let confirm_ms = self.timing.confirm_timeout_ms;
+                    let new_ctx = ConfirmContext {
+                        attempts: attempts.saturating_add(1),
+                        ..ctx.clone()
+                    };
+                    self.state = State::Confirming(new_ctx);
+                    vec![
+                        Action::PublishTtsSay {
+                            text: phrase.to_string(),
+                        },
+                        Action::StartConfirmTimer { ms: confirm_ms },
+                    ]
+                } else {
+                    // Final timeout — announce the return-to-idle with a
+                    // warm close before transitioning. DenyReason::Silence
+                    // is still recorded; the close line accompanies it.
+                    let intent_id = ctx.intent_id.clone();
+                    let mut acts = vec![
+                        Action::CancelConfirmTimer,
+                        Action::PublishTtsSay {
+                            text: silence_close().to_string(),
+                        },
+                        Action::PublishConfirmDenied {
+                            intent_id,
+                            reason: DenyReason::Silence,
+                        },
+                    ];
+                    acts.extend(self.transition_to(
+                        State::Idle,
+                        EventTag::ConfirmTimeout,
+                        now_ms,
+                    ));
+                    acts
+                }
             }
             (State::Confirming(ctx), Event::AudioWake) => {
                 let intent_id = ctx.intent_id.clone();
@@ -748,9 +783,18 @@ mod tests {
         }
     }
 
+    /// With `max_reprompts=0` the very first `ConfirmTimeout` should
+    /// immediately deny (no patience reprompts at all) and emit the
+    /// warm close line — reproducing today's "single-shot-then-silent"
+    /// behavior but with a spoken farewell.
     #[test]
-    fn confirm_denies_on_timeout() {
-        let mut fsm = Fsm::new(0);
+    fn confirm_denies_on_timeout_with_zero_reprompts() {
+        use crate::config::DialogTimingConfig;
+        let timing = DialogTimingConfig {
+            max_reprompts: 0,
+            ..DialogTimingConfig::default()
+        };
+        let mut fsm = Fsm::with_timing(0, timing);
         drive_to_confirming(&mut fsm, "delete-email");
         let acts = fsm.handle(Event::ConfirmTimeout, 30_700);
         assert_state(&fsm, StateTag::Idle);
@@ -761,6 +805,147 @@ mod tests {
                 ..
             }
         )));
+        // Warm close line is emitted before transitioning.
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "final timeout must emit a warm close via TTS"
+        );
+    }
+
+    /// AC1/AC2: with `max_reprompts=2`, two `ConfirmTimeout` events
+    /// should each reprompt with a distinct, escalating phrase (not deny),
+    /// and the third timeout should deny with `DenyReason::Silence`.
+    ///
+    /// AC3: the third (final) timeout emits a spoken close phrase before
+    /// the `Confirming → Idle` transition.
+    #[test]
+    fn confirm_timeout_reprompts_escalating_then_closes_warmly() {
+        use crate::config::DialogTimingConfig;
+        let timing = DialogTimingConfig {
+            max_reprompts: 2,
+            ..DialogTimingConfig::default()
+        };
+        let mut fsm = Fsm::with_timing(0, timing);
+        let confirm_ms = fsm.timing().confirm_timeout_ms;
+        drive_to_confirming(&mut fsm, "delete-email");
+
+        // First timeout → reprompt (attempt 0, stays Confirming).
+        let acts1 = fsm.handle(Event::ConfirmTimeout, 45_700);
+        assert_state(&fsm, StateTag::Confirming);
+        assert!(
+            acts1.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "first timeout: must emit warm check-in phrase"
+        );
+        // Timer restarted.
+        assert!(
+            acts1
+                .iter()
+                .any(|a| matches!(a, Action::StartConfirmTimer { ms } if *ms == confirm_ms)),
+            "first timeout: must restart confirm timer"
+        );
+        // No deny yet.
+        assert!(
+            !acts1.iter().any(|a| matches!(a, Action::PublishConfirmDenied { .. })),
+            "first timeout: must not deny yet"
+        );
+
+        // Collect first reprompt text.
+        let text1 = acts1
+            .iter()
+            .find_map(|a| {
+                if let Action::PublishTtsSay { text } = a {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("first timeout should emit TtsSay");
+
+        // Second timeout → reprompt (attempt 1, stays Confirming).
+        let acts2 = fsm.handle(Event::ConfirmTimeout, 91_400);
+        assert_state(&fsm, StateTag::Confirming);
+        assert!(
+            acts2.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "second timeout: must emit warm check-in phrase"
+        );
+        assert!(
+            !acts2.iter().any(|a| matches!(a, Action::PublishConfirmDenied { .. })),
+            "second timeout: must not deny yet"
+        );
+
+        // Collect second reprompt text — must differ from first (AC2).
+        let text2 = acts2
+            .iter()
+            .find_map(|a| {
+                if let Action::PublishTtsSay { text } = a {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("second timeout should emit TtsSay");
+        assert_ne!(
+            text1, text2,
+            "reprompt phrases must escalate (attempt 0 ≠ attempt 1)"
+        );
+
+        // Third timeout → final deny with spoken close (AC3).
+        let acts3 = fsm.handle(Event::ConfirmTimeout, 137_100);
+        assert_state(&fsm, StateTag::Idle);
+        assert!(
+            acts3.iter().any(|a| matches!(
+                a,
+                Action::PublishConfirmDenied {
+                    reason: DenyReason::Silence,
+                    ..
+                }
+            )),
+            "final timeout: DenyReason must be Silence"
+        );
+        // AC3: warm close phrase spoken before Idle transition.
+        assert!(
+            acts3.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "final timeout: must emit warm close line via TTS before returning to Idle"
+        );
+    }
+
+    /// AC4: `max_reprompts=1` reproduces the old single-shot behavior —
+    /// one intermediate reprompt, then deny on the second timeout.
+    #[test]
+    fn confirm_timeout_single_shot_regression_guard() {
+        use crate::config::DialogTimingConfig;
+        let timing = DialogTimingConfig {
+            max_reprompts: 1,
+            ..DialogTimingConfig::default()
+        };
+        let mut fsm = Fsm::with_timing(0, timing);
+        drive_to_confirming(&mut fsm, "delete-email");
+
+        // First timeout → one reprompt, stays Confirming.
+        let acts1 = fsm.handle(Event::ConfirmTimeout, 45_700);
+        assert_state(&fsm, StateTag::Confirming);
+        assert!(
+            acts1.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "one reprompt must still fire with max_reprompts=1"
+        );
+        assert!(
+            !acts1.iter().any(|a| matches!(a, Action::PublishConfirmDenied { .. })),
+            "must not deny on first timeout with max_reprompts=1"
+        );
+
+        // Second timeout → deny.
+        let acts2 = fsm.handle(Event::ConfirmTimeout, 91_400);
+        assert_state(&fsm, StateTag::Idle);
+        assert!(
+            acts2.iter().any(|a| matches!(
+                a,
+                Action::PublishConfirmDenied {
+                    reason: DenyReason::Silence,
+                    ..
+                }
+            )),
+            "second timeout with max_reprompts=1 must deny with Silence"
+        );
     }
 
     /// Verify that the FSM denies on ambiguity once `max_reprompts`

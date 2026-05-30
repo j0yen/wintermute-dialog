@@ -1402,9 +1402,21 @@ mod tests {
         assert!(!timer.is_active(), "verbal grant cancelled the timer");
     }
 
+    /// earshot-gentle-reprompt: a single `ConfirmTimeout` with
+    /// `max_reprompts=0` immediately denies (no intermediate reprompts),
+    /// but now emits a warm close phrase via TTS *before* the deny.
+    /// This test is the updated version of the original
+    /// `timer_event_drives_confirm_denied_silence_when_in_confirming`
+    /// test; `max_reprompts=0` pins the "no patience" boundary.
     #[tokio::test]
     async fn timer_event_drives_confirm_denied_silence_when_in_confirming() {
-        let state = fresh_state(0);
+        use crate::config::DialogTimingConfig;
+        // max_reprompts=0: no intermediate warm check-ins; one timeout → deny.
+        let timing = DialogTimingConfig {
+            max_reprompts: 0,
+            ..DialogTimingConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(Fsm::with_timing(0, timing)));
         let mut sink = MemSink::default();
         let (mut timer, mut rx) = fresh_timer();
         // Drive to Confirming.
@@ -1442,7 +1454,7 @@ mod tests {
         // Drain the bus events from the prompt so we only see the timeout fan-out.
         sink.events.lock().unwrap().clear();
 
-        // Replace the FSM-armed 30s timer with a short fuse for the test.
+        // Replace the FSM-armed timer with a short fuse for the test.
         timer.start(20);
         let ev = timeout(StdDuration::from_millis(500), rx.recv())
             .await
@@ -1450,9 +1462,9 @@ mod tests {
             .expect("channel open");
         assert_eq!(ev, Event::ConfirmTimeout);
 
-        // Feed the timer event back through dispatch — the FSM in
-        // Confirming should publish ConfirmDenied(silence) and return
-        // to Idle, with CancelConfirmTimer clearing the flag.
+        // Feed the timer event back through dispatch — with max_reprompts=0
+        // the FSM immediately publishes: TtsSay (warm close), ConfirmDenied(silence),
+        // State(idle). CancelConfirmTimer clears the flag.
         dispatch(state.as_ref(), &mut sink, &mut timer, ev, 100)
             .await
             .expect("timeout dispatch");
@@ -1460,9 +1472,11 @@ mod tests {
         assert_eq!(
             topics,
             vec![
+                outgoing::TTS_SPEAK.to_string(),
                 outgoing::CONFIRM_DENIED.to_string(),
                 outgoing::STATE.to_string(),
-            ]
+            ],
+            "final timeout must emit warm close TTS, then deny, then state"
         );
         let denied = sink.payload(outgoing::CONFIRM_DENIED);
         assert_eq!(denied["intent_id"], "i-10");

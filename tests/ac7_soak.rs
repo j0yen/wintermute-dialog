@@ -133,10 +133,14 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 },
                 t0 + 900,
             );
-            // First timeout → re-prompt (still in Confirming).
+            // Timeouts now drive the patience sequence from earshot-gentle-reprompt.
+            // Default max_reprompts=2: two warm check-in reprompts, then denial.
+            // First timeout (attempt 0 < 2) → warm check-in, stays Confirming.
             fsm.handle(Event::ConfirmTimeout, t0 + 31_000);
-            // Second timeout → deny + back to Idle.
+            // Second timeout (attempt 1 < 2) → warm check-in, stays Confirming.
             fsm.handle(Event::ConfirmTimeout, t0 + 62_000);
+            // Third timeout (attempt 2 >= 2) → spoken close + deny + back to Idle.
+            fsm.handle(Event::ConfirmTimeout, t0 + 93_000);
         }
         Scenario::DestructiveChildLock => {
             fsm.handle(Event::SetChildLock { enabled: true }, t0 + 5);

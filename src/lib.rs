@@ -27,6 +27,7 @@ pub mod config;
 pub mod daemon;
 pub mod event;
 pub mod fsm;
+pub mod silence;
 pub mod state;
 
 pub use action::{Action, DenyReason};
