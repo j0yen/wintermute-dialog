@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.0 — 2026-05-30
+
+Adds deterministic distress fast-path to wintermute-dialog (family-distress PRD).
+`src/distress.rs`: classify() phrase bank (Hard/Soft severity), DistressFsm with immediate Hard fire + Soft confirm loop, FamilyDistress envelope, assurance/failure phrases sourced from dedicated phrase bank (parallel to degrade.rs). Hard distress publishes wm.family.distress + speaks assurance with no API call; Soft prompts confirmation first; on_ack() failure is never silent. lib.rs: pub mod distress + re-exports. 32 unit tests covering all PRD §3 ACs.
+
 ## v0.4.0 — 2026-05-30
 
 ## wintermute-dialog-turn-fsm
