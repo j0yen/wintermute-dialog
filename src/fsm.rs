@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::{Action, DenyReason};
 use crate::config::DialogTimingConfig;
-use crate::degrade::{degrade_heard_nothing, degrade_think_error};
+use crate::degrade::{DegradeBank, DegradeKind};
 use crate::event::{Event, EventTag};
 use crate::silence::{silence_close, silence_reprompt};
 use crate::state::{ConfirmContext, Flags, State, StateTag};
@@ -78,6 +78,9 @@ pub struct Fsm {
     /// Runtime timing configuration. All deadline values are read from
     /// here; no hard-coded constants remain in the transition code.
     timing: DialogTimingConfig,
+    /// Rotating degrade phrase bank — advances per-kind cursor on each
+    /// error so consecutive failures of the same kind vary their output.
+    degrade: DegradeBank,
 }
 
 impl Fsm {
@@ -104,6 +107,7 @@ impl Fsm {
             history: VecDeque::new(),
             history_cap: DEFAULT_HISTORY_CAPACITY,
             timing,
+            degrade: DegradeBank::new(),
         }
     }
 
@@ -229,9 +233,10 @@ impl Fsm {
                 acts
             }
             (State::Listening | State::Transcribing, Event::SttUncertain) => {
+                let phrase = self.degrade.next_phrase(DegradeKind::SttUncertain);
                 let mut acts = vec![
                     Action::PublishTtsSay {
-                        text: degrade_heard_nothing(0).to_string(),
+                        text: phrase.to_string(),
                     },
                     Action::PublishDialogUnheard,
                     Action::CancelCaptureTimer,
@@ -279,9 +284,10 @@ impl Fsm {
             }
             // Transcribe timeout: speech ended but no STT result.
             (State::Transcribing, Event::TranscribeTimeout) => {
+                let phrase = self.degrade.next_phrase(DegradeKind::TranscribeTimeout);
                 let mut acts = vec![
                     Action::PublishTtsSay {
-                        text: degrade_heard_nothing(0).to_string(),
+                        text: phrase.to_string(),
                     },
                     Action::PublishDialogUnheard,
                     Action::PublishDialogTimeout,
@@ -310,9 +316,10 @@ impl Fsm {
             }
             // Think timeout: brain took too long.
             (State::Thinking, Event::ThinkTimeout) => {
+                let phrase = self.degrade.next_phrase(DegradeKind::ThinkTimeout);
                 let mut acts = vec![
                     Action::PublishTtsSay {
-                        text: degrade_think_error(0).to_string(),
+                        text: phrase.to_string(),
                     },
                     Action::PublishDialogTimeout,
                 ];
@@ -321,10 +328,11 @@ impl Fsm {
             }
             // Brain error: brain explicitly failed.
             (State::Thinking, Event::BrainError) => {
+                let phrase = self.degrade.next_phrase(DegradeKind::BrainError);
                 let mut acts = vec![
                     Action::CancelThinkTimer,
                     Action::PublishTtsSay {
-                        text: degrade_think_error(0).to_string(),
+                        text: phrase.to_string(),
                     },
                 ];
                 acts.extend(self.transition_to(State::Idle, EventTag::BrainError, now_ms));
