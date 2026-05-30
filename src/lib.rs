@@ -26,6 +26,7 @@ pub mod bus;
 pub mod config;
 pub mod daemon;
 pub mod event;
+pub mod family;
 pub mod fsm;
 pub mod silence;
 pub mod state;
@@ -37,5 +38,10 @@ pub use daemon::{
     write_snapshot_atomic,
 };
 pub use event::{Event, EventTag};
+pub use family::{
+    DEFAULT_ACK_TIMEOUT_MS, DEFAULT_RECIPIENT, FamilyAck, FamilyAction, FamilyFsm, FamilyMessage,
+    FamilyReply, FamilyState, TOPIC_FAMILY_ACK, TOPIC_FAMILY_DISTRESS, TOPIC_FAMILY_MESSAGE,
+    TOPIC_FAMILY_REPLY, Urgency, match_family_intent,
+};
 pub use fsm::{CONFIRM_TIMEOUT_MS, DEFAULT_HISTORY_CAPACITY, Fsm, MAX_REPROMPTS, Transition};
 pub use state::{ConfirmContext, Flags, State, StateTag};

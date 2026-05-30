@@ -292,7 +292,7 @@ impl Fsm {
                     // Patience reprompt: emit a warm check-in phrase,
                     // bump the attempt counter, restart the timer — stay
                     // in Confirming without a state transition.
-                    let phrase = silence_reprompt(attempts as usize);
+                    let phrase = silence_reprompt(usize::from(attempts));
                     let confirm_ms = self.timing.confirm_timeout_ms;
                     let new_ctx = ConfirmContext {
                         attempts: attempts.saturating_add(1),
