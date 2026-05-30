@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::{Action, DenyReason};
 use crate::config::DialogTimingConfig;
+use crate::degrade::{degrade_heard_nothing, degrade_think_error};
 use crate::event::{Event, EventTag};
 use crate::silence::{silence_close, silence_reprompt};
 use crate::state::{ConfirmContext, Flags, State, StateTag};
@@ -196,19 +197,48 @@ impl Fsm {
 
             // ── idle ────────────────────────────────────────────────
             (State::Idle, Event::AudioWake) => {
-                self.transition_to(State::Listening, EventTag::AudioWake, now_ms)
+                // Arm the capture timer; emit attention signal for UI hooks.
+                let capture_ms = self.timing.capture_timeout_ms;
+                let mut acts = vec![
+                    Action::PublishDialogAttention,
+                    Action::StartCaptureTimer { ms: capture_ms },
+                ];
+                acts.extend(self.transition_to(State::Listening, EventTag::AudioWake, now_ms));
+                acts
             }
 
             // ── listening ───────────────────────────────────────────
             (State::Listening, Event::AudioSpeechStart) => {
-                self.transition_to(State::Transcribing, EventTag::AudioSpeechStart, now_ms)
+                // Speech arrived — cancel capture timer, start transcribe timer.
+                let transcribe_ms = self.timing.transcribe_timeout_ms;
+                let mut acts = vec![
+                    Action::CancelCaptureTimer,
+                    Action::StartTranscribeTimer { ms: transcribe_ms },
+                ];
+                acts.extend(self.transition_to(
+                    State::Transcribing,
+                    EventTag::AudioSpeechStart,
+                    now_ms,
+                ));
+                acts
+            }
+            // Capture timeout: wake but no speech within the window.
+            (State::Listening, Event::CaptureTimeout) => {
+                let mut acts = vec![Action::PublishDialogTimeout];
+                acts.extend(self.transition_to(State::Idle, EventTag::CaptureTimeout, now_ms));
+                acts
             }
             (State::Listening | State::Transcribing, Event::SttUncertain) => {
-                let mut acts = vec![Action::PublishTtsSay {
-                    text: "Sorry, could you repeat that?".to_string(),
-                }];
+                let mut acts = vec![
+                    Action::PublishTtsSay {
+                        text: degrade_heard_nothing(0).to_string(),
+                    },
+                    Action::PublishDialogUnheard,
+                    Action::CancelCaptureTimer,
+                    Action::CancelTranscribeTimer,
+                ];
                 acts.extend(self.transition_to(
-                    State::Listening,
+                    State::Idle,
                     EventTag::SttUncertain,
                     now_ms,
                 ));
@@ -223,15 +253,22 @@ impl Fsm {
                     confidence,
                 },
             ) => {
+                // Cancel the transcribe timer; arm the think timer.
+                let think_ms = self.timing.think_timeout_ms;
                 let mut acts = vec![
+                    Action::CancelTranscribeTimer,
                     Action::PublishTurnUser {
                         transcript: transcript.clone(),
                         confidence,
                     },
                     Action::PublishBrainUtterance {
-                        transcript,
+                        transcript: transcript.clone(),
                         confidence,
                     },
+                    Action::PublishDialogHeard {
+                        text: transcript,
+                    },
+                    Action::StartThinkTimer { ms: think_ms },
                 ];
                 acts.extend(self.transition_to(
                     State::Thinking,
@@ -240,9 +277,27 @@ impl Fsm {
                 ));
                 acts
             }
+            // Transcribe timeout: speech ended but no STT result.
+            (State::Transcribing, Event::TranscribeTimeout) => {
+                let mut acts = vec![
+                    Action::PublishTtsSay {
+                        text: degrade_heard_nothing(0).to_string(),
+                    },
+                    Action::PublishDialogUnheard,
+                    Action::PublishDialogTimeout,
+                ];
+                acts.extend(self.transition_to(
+                    State::Idle,
+                    EventTag::TranscribeTimeout,
+                    now_ms,
+                ));
+                acts
+            }
             // ── thinking ────────────────────────────────────────────
             (State::Thinking, Event::BrainReply { text }) => {
+                // Cancel the think timer; enter speaking.
                 let mut acts = vec![
+                    Action::CancelThinkTimer,
                     Action::PublishTurnSystem { text: text.clone() },
                     Action::PublishTtsSay { text },
                 ];
@@ -251,6 +306,28 @@ impl Fsm {
                     EventTag::BrainReply,
                     now_ms,
                 ));
+                acts
+            }
+            // Think timeout: brain took too long.
+            (State::Thinking, Event::ThinkTimeout) => {
+                let mut acts = vec![
+                    Action::PublishTtsSay {
+                        text: degrade_think_error(0).to_string(),
+                    },
+                    Action::PublishDialogTimeout,
+                ];
+                acts.extend(self.transition_to(State::Idle, EventTag::ThinkTimeout, now_ms));
+                acts
+            }
+            // Brain error: brain explicitly failed.
+            (State::Thinking, Event::BrainError) => {
+                let mut acts = vec![
+                    Action::CancelThinkTimer,
+                    Action::PublishTtsSay {
+                        text: degrade_think_error(0).to_string(),
+                    },
+                ];
+                acts.extend(self.transition_to(State::Idle, EventTag::BrainError, now_ms));
                 acts
             }
             (
@@ -267,8 +344,13 @@ impl Fsm {
                 self.transition_to(State::Idle, EventTag::TtsEnd, now_ms)
             }
             (State::Speaking, Event::AudioWake) => {
-                // Barge-in: cancel TTS, return to listening.
-                let mut acts = vec![Action::PublishTtsCancel];
+                // Barge-in: cancel TTS, arm capture timer, enter listening.
+                let capture_ms = self.timing.capture_timeout_ms;
+                let mut acts = vec![
+                    Action::PublishTtsCancel,
+                    Action::PublishDialogAttention,
+                    Action::StartCaptureTimer { ms: capture_ms },
+                ];
                 acts.extend(self.transition_to(
                     State::Listening,
                     EventTag::AudioWake,
@@ -412,18 +494,20 @@ impl Fsm {
         confirm_keyword: String,
         now_ms: u64,
     ) -> Vec<Action> {
+        // Cancel the think timer — the brain replied (destructively).
+        let mut prelude = vec![Action::CancelThinkTimer];
         if self.flags.child_locked {
             // Silent deny — no TTS, no prompt. PRD §2.5.
-            let mut acts = vec![Action::PublishConfirmDenied {
+            prelude.push(Action::PublishConfirmDenied {
                 intent_id,
                 reason: DenyReason::ChildLock,
-            }];
-            acts.extend(self.transition_to(
+            });
+            prelude.extend(self.transition_to(
                 State::Idle,
                 EventTag::BrainReplyDestructive,
                 now_ms,
             ));
-            return acts;
+            return prelude;
         }
 
         let prompt = format!(
@@ -437,12 +521,11 @@ impl Fsm {
         });
         // Read deadline from config — no magic constant in transition code.
         let confirm_ms = self.timing.confirm_timeout_ms;
-        let mut acts = vec![
-            Action::PublishTtsSay { text: prompt },
-            Action::StartConfirmTimer { ms: confirm_ms },
-        ];
-        acts.extend(self.transition_to(next, EventTag::BrainReplyDestructive, now_ms));
-        acts
+        // prelude already contains CancelThinkTimer.
+        prelude.push(Action::PublishTtsSay { text: prompt });
+        prelude.push(Action::StartConfirmTimer { ms: confirm_ms });
+        prelude.extend(self.transition_to(next, EventTag::BrainReplyDestructive, now_ms));
+        prelude
     }
 
     fn handle_confirm_utterance(
@@ -590,15 +673,27 @@ mod tests {
         let mut fsm = Fsm::new(0);
         let acts = fsm.handle(Event::AudioWake, 100);
         assert_state(&fsm, StateTag::Listening);
-        assert_eq!(acts.len(), 1);
-        assert!(matches!(
-            acts[0],
-            Action::PublishState {
-                prior: StateTag::Idle,
-                next: StateTag::Listening,
-                since_ms: 100
-            }
-        ));
+        // turn-fsm: wake now emits attention signal + capture timer + state.
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishDialogAttention)),
+            "wake must emit PublishDialogAttention"
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::StartCaptureTimer { .. })),
+            "wake must arm capture timer"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                Action::PublishState {
+                    prior: StateTag::Idle,
+                    next: StateTag::Listening,
+                    since_ms: 100
+                }
+            )),
+            "wake must emit PublishState"
+        );
     }
 
     #[test]
@@ -674,20 +769,25 @@ mod tests {
 
     #[test]
     fn stt_uncertain_re_prompts_without_wedging() {
-        // AC2: 5 sequential uncertains return to listening every time
-        // with exactly one re-prompt utterance per event.
+        // turn-fsm: uncertain now correctly routes to Idle (not Listening)
+        // so the conversation can restart fresh. Each iteration re-wakes.
         let mut fsm = Fsm::new(0);
-        fsm.handle(Event::AudioWake, 50);
         for i in 0..5 {
-            let t = 100 + i * 200;
-            fsm.handle(Event::AudioSpeechStart, t);
-            let acts = fsm.handle(Event::SttUncertain, t + 50);
-            assert_state(&fsm, StateTag::Listening);
+            let t = i * 300;
+            fsm.handle(Event::AudioWake, t);
+            fsm.handle(Event::AudioSpeechStart, t + 50);
+            let acts = fsm.handle(Event::SttUncertain, t + 100);
+            assert_state(&fsm, StateTag::Idle);
             let reprompts = acts
                 .iter()
                 .filter(|a| matches!(a, Action::PublishTtsSay { .. }))
                 .count();
-            assert_eq!(reprompts, 1, "exactly one re-prompt per uncertain");
+            assert_eq!(reprompts, 1, "exactly one degrade phrase per uncertain");
+            let unheard = acts
+                .iter()
+                .filter(|a| matches!(a, Action::PublishDialogUnheard))
+                .count();
+            assert_eq!(unheard, 1, "exactly one PublishDialogUnheard per uncertain");
         }
     }
 
@@ -1100,10 +1200,13 @@ mod tests {
     #[test]
     fn history_returns_last_n_in_chronological_order() {
         let mut fsm = Fsm::with_history_capacity(0, 4);
-        // Drive 6 transitions; only the last 4 remain.
+        // Drive transitions; only the last 4 remain in the ring.
+        // turn-fsm: SttUncertain now goes to Idle (not Listening), so we
+        // re-wake before the second capture attempt.
         fsm.handle(Event::AudioWake, 100); // idle→listening
         fsm.handle(Event::AudioSpeechStart, 150); // listening→transcribing
-        fsm.handle(Event::SttUncertain, 200); // transcribing→listening
+        fsm.handle(Event::SttUncertain, 200); // transcribing→idle (degrade)
+        fsm.handle(Event::AudioWake, 220); // idle→listening (second attempt)
         fsm.handle(Event::AudioSpeechStart, 250); // listening→transcribing
         fsm.handle(
             Event::SttFinal {
@@ -1119,6 +1222,9 @@ mod tests {
             400,
         ); // thinking→speaking
 
+        // Cap=4 so at most 4 entries. We drove 7 transitions; last 4 are:
+        // listening→transcribing (t=250), transcribing→thinking (t=300),
+        // thinking→speaking (t=400). The ring at most 4.
         let last3 = fsm.history(3);
         assert_eq!(last3.len(), 3);
         assert_eq!(last3[0].next, StateTag::Transcribing);
@@ -1242,6 +1348,242 @@ mod tests {
                 confirm_keyword: keyword.to_string(),
             },
             500,
+        );
+    }
+
+    // ── turn-fsm new-transition tests ────────────────────────────────
+
+    /// AC5 (PRD §3 #5) — capture timeout: wake but no speech within the
+    /// allotted window returns to Idle and publishes `wm.dialog.timeout`.
+    #[test]
+    fn capture_timeout_returns_to_idle_with_timeout_signal() {
+        let mut fsm = Fsm::new(0);
+        fsm.handle(Event::AudioWake, 100); // idle→listening
+        assert_state(&fsm, StateTag::Listening);
+        let acts = fsm.handle(Event::CaptureTimeout, 8_100);
+        assert_state(&fsm, StateTag::Idle);
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishDialogTimeout)),
+            "capture timeout must emit PublishDialogTimeout"
+        );
+    }
+
+    /// Transcribe timeout: speech started but no STT result returns to
+    /// Idle, emits degrade phrase + unheard + timeout signals.
+    #[test]
+    fn transcribe_timeout_returns_to_idle_with_degrade_and_timeout() {
+        let mut fsm = Fsm::new(0);
+        fsm.handle(Event::AudioWake, 100);
+        fsm.handle(Event::AudioSpeechStart, 200);
+        assert_state(&fsm, StateTag::Transcribing);
+        let acts = fsm.handle(Event::TranscribeTimeout, 3_200);
+        assert_state(&fsm, StateTag::Idle);
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "transcribe timeout must emit a degrade TtsSay"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishDialogUnheard)),
+            "transcribe timeout must emit PublishDialogUnheard"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishDialogTimeout)),
+            "transcribe timeout must emit PublishDialogTimeout"
+        );
+    }
+
+    /// Think timeout: brain took too long, returns to Idle with degrade
+    /// phrase + timeout signal.
+    #[test]
+    fn think_timeout_returns_to_idle_with_degrade_and_timeout() {
+        let mut fsm = Fsm::new(0);
+        drive_to_thinking(&mut fsm);
+        let acts = fsm.handle(Event::ThinkTimeout, 10_300);
+        assert_state(&fsm, StateTag::Idle);
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "think timeout must emit a degrade TtsSay"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishDialogTimeout)),
+            "think timeout must emit PublishDialogTimeout"
+        );
+    }
+
+    /// Brain error: explicit brain failure transitions to Idle with
+    /// degrade phrase. CancelThinkTimer is emitted.
+    #[test]
+    fn brain_error_returns_to_idle_with_degrade_and_cancel_timer() {
+        let mut fsm = Fsm::new(0);
+        drive_to_thinking(&mut fsm);
+        let acts = fsm.handle(Event::BrainError, 400);
+        assert_state(&fsm, StateTag::Idle);
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "brain error must emit a degrade TtsSay"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::CancelThinkTimer)),
+            "brain error must cancel the think timer"
+        );
+    }
+
+    /// AC1 (PRD §3 #1) happy-path round-trip: wake → speech-start →
+    /// stt.final → brain.reply → tts.end transitions Listening →
+    /// Capturing → Transcribing → Thinking → Speaking → Idle.
+    #[test]
+    fn happy_path_full_round_trip() {
+        let mut fsm = Fsm::new(0);
+        assert_state(&fsm, StateTag::Idle);
+
+        // Idle → Listening (with attention + capture timer).
+        let wake_acts = fsm.handle(Event::AudioWake, 100);
+        assert_state(&fsm, StateTag::Listening);
+        assert!(wake_acts
+            .iter()
+            .any(|a| matches!(a, Action::PublishDialogAttention)));
+
+        // Listening → Transcribing (with cancel-capture + start-transcribe).
+        let speech_acts = fsm.handle(Event::AudioSpeechStart, 200);
+        assert_state(&fsm, StateTag::Transcribing);
+        assert!(speech_acts
+            .iter()
+            .any(|a| matches!(a, Action::CancelCaptureTimer)));
+        assert!(speech_acts
+            .iter()
+            .any(|a| matches!(a, Action::StartTranscribeTimer { .. })));
+
+        // Transcribing → Thinking (with heard signal + cancel-transcribe + start-think).
+        let stt_acts = fsm.handle(
+            Event::SttFinal {
+                transcript: "what time is it".to_string(),
+                confidence: 0.95,
+            },
+            500,
+        );
+        assert_state(&fsm, StateTag::Thinking);
+        assert!(stt_acts
+            .iter()
+            .any(|a| matches!(a, Action::PublishDialogHeard { text } if text == "what time is it")));
+        assert!(stt_acts
+            .iter()
+            .any(|a| matches!(a, Action::CancelTranscribeTimer)));
+        assert!(stt_acts
+            .iter()
+            .any(|a| matches!(a, Action::StartThinkTimer { .. })));
+
+        // Thinking → Speaking (with cancel-think timer).
+        let brain_acts = fsm.handle(
+            Event::BrainReply {
+                text: "it's three o'clock".to_string(),
+            },
+            900,
+        );
+        assert_state(&fsm, StateTag::Speaking);
+        assert!(brain_acts
+            .iter()
+            .any(|a| matches!(a, Action::CancelThinkTimer)));
+
+        // Speaking → Idle.
+        fsm.handle(Event::TtsEnd, 1500);
+        assert_state(&fsm, StateTag::Idle);
+    }
+
+    /// AC4 (PRD §3 #4) barge-in transition: from Speaking, wake emits
+    /// TtsCancel + attention signal and enters Listening within the
+    /// action list.
+    #[test]
+    fn barge_in_from_speaking_emits_attention_and_cancel() {
+        let mut fsm = Fsm::new(0);
+        drive_to_speaking(&mut fsm);
+        assert_state(&fsm, StateTag::Speaking);
+        let acts = fsm.handle(Event::AudioWake, 500);
+        assert_state(&fsm, StateTag::Listening);
+        assert!(
+            acts.contains(&Action::PublishTtsCancel),
+            "barge-in must cancel TTS"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishDialogAttention)),
+            "barge-in must emit attention signal"
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::StartCaptureTimer { .. })),
+            "barge-in must arm capture timer"
+        );
+    }
+
+    /// AC6 (PRD §3 #6) transcription failure: stt.uncertain emits a
+    /// degrade phrase via TTS and returns to Idle.
+    #[test]
+    fn stt_uncertain_emits_degrade_and_unheard() {
+        let mut fsm = Fsm::new(0);
+        fsm.handle(Event::AudioWake, 100);
+        fsm.handle(Event::AudioSpeechStart, 200);
+        assert_state(&fsm, StateTag::Transcribing);
+        let acts = fsm.handle(Event::SttUncertain, 300);
+        assert_state(&fsm, StateTag::Idle);
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishTtsSay { .. })),
+            "uncertain must emit degrade TtsSay"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PublishDialogUnheard)),
+            "uncertain must emit PublishDialogUnheard"
+        );
+    }
+
+    /// Capture timer is started on wake and cancelled on speech-start.
+    #[test]
+    fn capture_timer_armed_then_cancelled_on_speech() {
+        let mut fsm = Fsm::new(0);
+        let wake_acts = fsm.handle(Event::AudioWake, 100);
+        assert!(
+            wake_acts
+                .iter()
+                .any(|a| matches!(a, Action::StartCaptureTimer { .. })),
+            "wake must arm capture timer"
+        );
+        let speech_acts = fsm.handle(Event::AudioSpeechStart, 200);
+        assert!(
+            speech_acts
+                .iter()
+                .any(|a| matches!(a, Action::CancelCaptureTimer)),
+            "speech-start must cancel capture timer"
+        );
+    }
+
+    /// Think timer is started on stt.final and cancelled on brain.reply.
+    #[test]
+    fn think_timer_armed_then_cancelled_on_brain_reply() {
+        let mut fsm = Fsm::new(0);
+        fsm.handle(Event::AudioWake, 100);
+        fsm.handle(Event::AudioSpeechStart, 200);
+        let stt_acts = fsm.handle(
+            Event::SttFinal {
+                transcript: "hello".to_string(),
+                confidence: 0.9,
+            },
+            300,
+        );
+        assert!(
+            stt_acts
+                .iter()
+                .any(|a| matches!(a, Action::StartThinkTimer { .. })),
+            "stt.final must arm think timer"
+        );
+        let brain_acts = fsm.handle(
+            Event::BrainReply {
+                text: "hi".to_string(),
+            },
+            400,
+        );
+        assert!(
+            brain_acts
+                .iter()
+                .any(|a| matches!(a, Action::CancelThinkTimer)),
+            "brain.reply must cancel think timer"
         );
     }
 }

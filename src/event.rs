@@ -56,6 +56,18 @@ pub enum Event {
     },
     /// Internal `confirm-timeout` tick fired by the FSM driver.
     ConfirmTimeout,
+    /// Internal capture-timeout tick: wake fired but no speech detected
+    /// within the allotted window (PRD §2.1 `Listening + timeout 8s`).
+    CaptureTimeout,
+    /// Internal transcribe-timeout tick: speech ended but no STT result
+    /// within the allotted window (PRD §2.1 `Transcribing + timeout 3s`).
+    TranscribeTimeout,
+    /// Internal think-timeout tick: utterance forwarded to brain but no
+    /// reply within the allotted window (PRD §2.1 `Thinking + timeout 10s`).
+    ThinkTimeout,
+    /// `wm.brain.error` — brain encountered an error processing the
+    /// utterance; triggers degrade-path TTS then returns to Idle.
+    BrainError,
 }
 
 /// Payload-less event identifier used in transition history entries.
@@ -88,6 +100,14 @@ pub enum EventTag {
     SetChildLock,
     /// See [`Event::ConfirmTimeout`].
     ConfirmTimeout,
+    /// See [`Event::CaptureTimeout`].
+    CaptureTimeout,
+    /// See [`Event::TranscribeTimeout`].
+    TranscribeTimeout,
+    /// See [`Event::ThinkTimeout`].
+    ThinkTimeout,
+    /// See [`Event::BrainError`].
+    BrainError,
 }
 
 impl Event {
@@ -108,6 +128,10 @@ impl Event {
             Self::UnmuteRequest => EventTag::UnmuteRequest,
             Self::SetChildLock { .. } => EventTag::SetChildLock,
             Self::ConfirmTimeout => EventTag::ConfirmTimeout,
+            Self::CaptureTimeout => EventTag::CaptureTimeout,
+            Self::TranscribeTimeout => EventTag::TranscribeTimeout,
+            Self::ThinkTimeout => EventTag::ThinkTimeout,
+            Self::BrainError => EventTag::BrainError,
         }
     }
 }
@@ -157,6 +181,10 @@ mod tests {
             (Event::UnmuteRequest, EventTag::UnmuteRequest),
             (Event::SetChildLock { enabled: true }, EventTag::SetChildLock),
             (Event::ConfirmTimeout, EventTag::ConfirmTimeout),
+            (Event::CaptureTimeout, EventTag::CaptureTimeout),
+            (Event::TranscribeTimeout, EventTag::TranscribeTimeout),
+            (Event::ThinkTimeout, EventTag::ThinkTimeout),
+            (Event::BrainError, EventTag::BrainError),
         ];
         for (ev, expected) in pairs {
             assert_eq!(ev.tag(), *expected);
