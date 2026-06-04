@@ -19,9 +19,21 @@
 
 use serde::{Deserialize, Serialize};
 
-/// All prefixes the daemon subscribes to. iter-5 iterates this slice
-/// when building the subscribe-side bus client.
-pub const SUBSCRIBE_PREFIXES: [&str; 3] = ["wm.audio.", "wm.stt.", "wm.brain."];
+/// Topics the daemon subscribes to — the EXACT set it handles, not broad
+/// prefixes. The old `wm.audio.` prefix also matched the high-volume
+/// `wm.audio.speech.chunk` PCM stream (which dialog doesn't decode), flooding
+/// the single-consumer loop with thousands of decode-failed warnings and
+/// delaying real wake/speech.end events. `wm.brain.reply` also covers
+/// `wm.brain.reply.destructive` (prefix match).
+pub const SUBSCRIBE_PREFIXES: [&str; 7] = [
+    "wm.audio.wake",
+    "wm.audio.speech.start",
+    "wm.audio.speech.end",
+    "wm.stt.partial",
+    "wm.stt.final",
+    "wm.stt.uncertain",
+    "wm.brain.reply",
+];
 
 /// Incoming topics handled by the daemon (PRD §2.2 subscribed-table).
 pub mod incoming {
