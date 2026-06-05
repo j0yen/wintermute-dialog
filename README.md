@@ -130,6 +130,7 @@ scaffolded as a follow-on PRD and is not invoked by default.
 
 ## Recent
 
+- **v0.7.0** — propagate `turn_id` from `wm.stt.final` onto `wm.dialog.turn.user` and `wm.dialog.state` (PRD lucid-turn-id AC3/AC5); additive/optional field.
 - **v0.3.0** — `wm.family.*` topic contract + family-intent matcher. Adds
   `src/family.rs` with four topic constants, `FamilyMessage`/`FamilyAck`/
   `FamilyReply` serde types, deterministic `match_family_intent()` (no Claude API),

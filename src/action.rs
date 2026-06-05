@@ -21,6 +21,9 @@ pub enum Action {
         next: StateTag,
         /// Wall-clock ms spent in `prior` before this transition.
         since_ms: u64,
+        /// Turn identifier from the triggering `wm.stt.final` event, if any.
+        /// `None` for transitions not triggered by a user utterance (AC5).
+        turn_id: Option<String>,
     },
     /// Publish `wm.dialog.turn.user`.
     PublishTurnUser {
@@ -28,6 +31,9 @@ pub enum Action {
         transcript: String,
         /// `[0.0, 1.0]` recognizer confidence.
         confidence: f32,
+        /// Turn identifier from the triggering `wm.stt.final` event, if any.
+        /// `None` when no inbound id was present (AC5).
+        turn_id: Option<String>,
     },
     /// Publish `wm.dialog.turn.system`.
     PublishTurnSystem {

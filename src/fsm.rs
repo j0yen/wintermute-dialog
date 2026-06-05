@@ -256,6 +256,7 @@ impl Fsm {
                 Event::SttFinal {
                     transcript,
                     confidence,
+                    turn_id,
                 },
             ) => {
                 // Cancel the transcribe timer; arm the think timer.
@@ -265,6 +266,7 @@ impl Fsm {
                     Action::PublishTurnUser {
                         transcript: transcript.clone(),
                         confidence,
+                        turn_id: turn_id.clone(),
                     },
                     Action::PublishBrainUtterance {
                         transcript: transcript.clone(),
@@ -275,11 +277,19 @@ impl Fsm {
                     },
                     Action::StartThinkTimer { ms: think_ms },
                 ];
-                acts.extend(self.transition_to(
+                // Propagate turn_id into the state transition (AC3).
+                let mut state_acts = self.transition_to(
                     State::Thinking,
                     EventTag::SttFinal,
                     now_ms,
-                ));
+                );
+                // transition_to emits exactly one PublishState; patch its turn_id.
+                if let Some(Action::PublishState { turn_id: tid, .. }) =
+                    state_acts.first_mut()
+                {
+                    *tid = turn_id;
+                }
+                acts.extend(state_acts);
                 acts
             }
             // Transcribe timeout: speech ended but no STT result.
@@ -373,6 +383,7 @@ impl Fsm {
                 Event::SttFinal {
                     transcript,
                     confidence: _,
+                    turn_id: _,
                 },
             ) => self.handle_confirm_utterance(ctx.clone(), &transcript, now_ms),
             (State::Confirming(ctx), Event::ConfirmTimeout) => {
@@ -461,6 +472,7 @@ impl Fsm {
             prior: prior_tag,
             next: new_tag,
             since_ms,
+            turn_id: None,
         }]
     }
 
@@ -697,7 +709,8 @@ mod tests {
                 Action::PublishState {
                     prior: StateTag::Idle,
                     next: StateTag::Listening,
-                    since_ms: 100
+                    since_ms: 100,
+                    ..
                 }
             )),
             "wake must emit PublishState"
@@ -721,6 +734,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "what time is it".to_string(),
                 confidence: 0.93,
+                turn_id: None,
             },
             300,
         );
@@ -743,6 +757,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hi".to_string(),
                 confidence: 1.0,
+                turn_id: None,
             },
             300,
         );
@@ -807,6 +822,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "yes delete-email".to_string(),
                 confidence: 0.99,
+                turn_id: None,
             },
             700,
         );
@@ -837,6 +853,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "yes".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             700,
         );
@@ -856,6 +873,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "delete-email".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             800,
         );
@@ -874,6 +892,7 @@ mod tests {
                 Event::SttFinal {
                     transcript: word.to_string(),
                     confidence: 0.9,
+                    turn_id: None,
                 },
                 700,
             );
@@ -1074,6 +1093,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "what?".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             700,
         );
@@ -1083,6 +1103,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "yeah maybe".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             800,
         );
@@ -1108,6 +1129,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "what?".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             700,
         );
@@ -1117,6 +1139,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hmm?".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             800,
         );
@@ -1130,6 +1153,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "yeah maybe".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             900,
         );
@@ -1220,6 +1244,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hi".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             300,
         ); // transcribing→thinking
@@ -1332,6 +1357,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hi".to_string(),
                 confidence: 0.99,
+                turn_id: None,
             },
             300,
         );
@@ -1466,6 +1492,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "what time is it".to_string(),
                 confidence: 0.95,
+                turn_id: None,
             },
             500,
         );
@@ -1572,6 +1599,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hello".to_string(),
                 confidence: 0.9,
+                turn_id: None,
             },
             300,
         );

@@ -296,6 +296,7 @@ pub fn request_to_event(req: Request) -> Event {
         Request::SttFinal(p) => Event::SttFinal {
             transcript: p.text,
             confidence: p.confidence,
+            turn_id: p.turn_id,
         },
         Request::SttUncertain(_) => Event::SttUncertain,
         Request::BrainReply(p) => Event::BrainReply { text: p.text },
@@ -354,19 +355,23 @@ pub fn action_to_value(action: &Action, ts: u64) -> Result<Option<Value>> {
             prior,
             next,
             since_ms,
+            turn_id,
         } => Some(serde_json::to_value(&StateEvent {
             state: state_tag_snake(*next).to_string(),
             prior_state: state_tag_snake(*prior).to_string(),
             since_ms: *since_ms,
             ts,
+            turn_id: turn_id.clone(),
         })?),
         Action::PublishTurnUser {
             transcript,
             confidence,
+            turn_id,
         } => Some(serde_json::to_value(&TurnUserEvent {
             transcript: transcript.clone(),
             confidence: *confidence,
             ts,
+            turn_id: turn_id.clone(),
         })?),
         Action::PublishTurnSystem { text } => Some(serde_json::to_value(&TurnSystemEvent {
             text: text.clone(),
@@ -751,10 +756,12 @@ mod tests {
                 confidence: 0.8,
                 audio_duration_ms: None,
                 ts: 0,
+                turn_id: None,
             })),
             Event::SttFinal {
                 transcript: "hi".to_string(),
                 confidence: 0.8,
+                turn_id: None,
             }
         );
         assert_eq!(
@@ -796,6 +803,7 @@ mod tests {
                 prior: StateTag::Idle,
                 next: StateTag::Listening,
                 since_ms: 0,
+                turn_id: None,
             }),
             Some(outgoing::STATE)
         );
@@ -803,6 +811,7 @@ mod tests {
             topic_for_action(&Action::PublishTurnUser {
                 transcript: String::new(),
                 confidence: 0.0,
+                turn_id: None,
             }),
             Some(outgoing::TURN_USER)
         );
@@ -864,6 +873,7 @@ mod tests {
                 prior: StateTag::Speaking,
                 next: StateTag::Idle,
                 since_ms: 1200,
+                turn_id: None,
             },
             999,
         )
@@ -949,6 +959,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "what time is it".to_string(),
                 confidence: 0.91,
+                turn_id: None,
             },
             30,
         )
@@ -1006,6 +1017,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hi".into(),
                 confidence: 0.99,
+                turn_id: None,
             },
             30,
         )
@@ -1058,6 +1070,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hi".into(),
                 confidence: 1.0,
+                turn_id: None,
             },
             30,
         )
@@ -1118,6 +1131,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "delete it".into(),
                 confidence: 0.9,
+                turn_id: None,
             },
             30,
         )
@@ -1188,6 +1202,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "drop the db".into(),
                 confidence: 0.9,
+                turn_id: None,
             },
             30,
         )
@@ -1274,6 +1289,7 @@ mod tests {
                 Event::SttFinal {
                     transcript: "do the destructive thing".into(),
                     confidence: 0.9,
+                    turn_id: None,
                 },
                 30,
             )
@@ -1415,6 +1431,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "delete it".into(),
                 confidence: 0.9,
+                turn_id: None,
             },
             30,
         )
@@ -1442,6 +1459,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "yes drop-x".into(),
                 confidence: 1.0,
+                turn_id: None,
             },
             50,
         )
@@ -1481,6 +1499,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "delete it".into(),
                 confidence: 0.9,
+                turn_id: None,
             },
             30,
         )
@@ -1561,6 +1580,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hi".into(),
                 confidence: 1.0,
+                turn_id: None,
             },
             30,
         )
@@ -1632,6 +1652,7 @@ mod tests {
             Event::SttFinal {
                 transcript: "hi".into(),
                 confidence: 1.0,
+                turn_id: None,
             },
             30,
         )
@@ -1789,6 +1810,103 @@ mod tests {
             parent.ends_with("wm-dialog"),
             "expected ../wm-dialog/state.json, got {}",
             p.display()
+        );
+    }
+
+    // ── turn_id propagation (PRD lucid-turn-id AC3 / AC5) ──────────
+
+    /// AC3 (dialog half): given an stt.final carrying turn_id "test-id-001",
+    /// the emitted wm.dialog.turn.user and wm.dialog.state must both carry
+    /// "test-id-001".
+    #[tokio::test]
+    async fn dispatch_stt_final_carries_turn_id_onto_turn_user_and_state() {
+        let state = fresh_state(0);
+        let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
+        // Drive FSM to Transcribing.
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        sink.events.lock().unwrap().clear();
+
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::SttFinal {
+                transcript: "set a timer".to_string(),
+                confidence: 0.88,
+                turn_id: Some("test-id-001".to_string()),
+            },
+            30,
+        )
+        .await
+        .expect("stt final with turn_id");
+
+        let turn_user = sink.payload(outgoing::TURN_USER);
+        assert_eq!(
+            turn_user["turn_id"],
+            "test-id-001",
+            "turn_user must carry inbound turn_id (AC3)"
+        );
+
+        let state_ev = sink.payload(outgoing::STATE);
+        assert_eq!(
+            state_ev["turn_id"],
+            "test-id-001",
+            "dialog.state must carry inbound turn_id (AC3)"
+        );
+    }
+
+    /// AC5 (dialog half): an stt.final with NO turn_id must still be
+    /// processed correctly; turn_user and dialog.state must NOT include
+    /// a `turn_id` field.
+    #[tokio::test]
+    async fn dispatch_stt_final_no_turn_id_when_absent() {
+        let state = fresh_state(0);
+        let mut sink = MemSink::default();
+        let (mut timer, _trx) = fresh_timer();
+        // Drive FSM to Transcribing.
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        sink.events.lock().unwrap().clear();
+
+        // Deserialize a legacy stt.final payload (no turn_id field) and check it
+        // still parses and round-trips through the dispatch path.
+        let legacy_payload = serde_json::json!({
+            "text": "play some music",
+            "confidence": 0.92_f32,
+            "ts": 30_u64
+        });
+        let req = crate::bus::decode_request(
+            crate::bus::incoming::STT_FINAL,
+            &legacy_payload,
+        )
+        .expect("legacy stt.final decodes (AC5)");
+        let event = request_to_event(req);
+
+        dispatch(state.as_ref(), &mut sink, &mut timer, event, 30)
+            .await
+            .expect("dispatch legacy stt.final");
+
+        let turn_user = sink.payload(outgoing::TURN_USER);
+        assert!(
+            turn_user.get("turn_id").is_none()
+                || turn_user["turn_id"].is_null(),
+            "turn_user must NOT carry turn_id when absent (AC5); got {turn_user:?}"
+        );
+        let state_ev = sink.payload(outgoing::STATE);
+        assert!(
+            state_ev.get("turn_id").is_none()
+                || state_ev["turn_id"].is_null(),
+            "dialog.state must NOT carry turn_id when absent (AC5); got {state_ev:?}"
         );
     }
 }

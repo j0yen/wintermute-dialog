@@ -24,6 +24,9 @@ pub enum Event {
         transcript: String,
         /// `[0.0, 1.0]` confidence from the recognizer.
         confidence: f32,
+        /// Turn identifier copied from the inbound `wm.stt.final` event.
+        /// `None` when no id was present (backward compat, AC5).
+        turn_id: Option<String>,
     },
     /// `wm.stt.uncertain` — recognizer abstained; re-prompt the user.
     SttUncertain,
@@ -158,6 +161,7 @@ mod tests {
                 Event::SttFinal {
                     transcript: "hi".to_string(),
                     confidence: 0.9,
+                    turn_id: None,
                 },
                 EventTag::SttFinal,
             ),

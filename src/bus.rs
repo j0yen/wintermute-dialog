@@ -164,6 +164,10 @@ pub struct SttFinalPayload {
     pub audio_duration_ms: Option<u32>,
     /// Unix milliseconds at emission.
     pub ts: u64,
+    /// Turn identifier minted by `wm-audio` and propagated by `wm-stt`.
+    /// Absent on legacy events (backward compat, AC5).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub turn_id: Option<String>,
 }
 
 /// `wm.stt.uncertain` payload.
@@ -210,6 +214,10 @@ pub struct StateEvent {
     pub since_ms: u64,
     /// Unix milliseconds when the transition fired.
     pub ts: u64,
+    /// Turn identifier carried from the triggering `wm.stt.final` event.
+    /// Absent when the transition was not triggered by a user utterance (AC5).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub turn_id: Option<String>,
 }
 
 /// Outbound `wm.dialog.turn.user` payload (consumed by `wintermute-brain`).
@@ -221,6 +229,10 @@ pub struct TurnUserEvent {
     pub confidence: f32,
     /// Unix milliseconds at emission.
     pub ts: u64,
+    /// Turn identifier copied from the triggering `wm.stt.final` event.
+    /// Absent when no inbound id was present (backward compat, AC5).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub turn_id: Option<String>,
 }
 
 /// Outbound `wm.dialog.turn.system` payload.
@@ -472,6 +484,7 @@ mod tests {
             prior_state: "thinking".into(),
             since_ms: 1200,
             ts: 100,
+            turn_id: None,
         };
         let v = serde_json::to_value(&ev).expect("serializes");
         let back: StateEvent = serde_json::from_value(v).expect("round trips");
@@ -484,6 +497,7 @@ mod tests {
             transcript: "what time is it".into(),
             confidence: 0.88,
             ts: 50,
+            turn_id: None,
         };
         let v = serde_json::to_value(&user).expect("serializes");
         let back: TurnUserEvent = serde_json::from_value(v).expect("round trips");
@@ -557,7 +571,18 @@ mod tests {
         assert_eq!(outgoing::BRAIN_UTTERANCE, "wm.brain.utterance");
         assert_eq!(outgoing::AUDIO_MUTE, "wm.audio.mute");
         assert_eq!(outgoing::AUDIO_UNMUTE, "wm.audio.unmute");
-        assert_eq!(SUBSCRIBE_PREFIXES, ["wm.audio.", "wm.stt.", "wm.brain."]);
+        assert_eq!(
+            SUBSCRIBE_PREFIXES,
+            [
+                "wm.audio.wake",
+                "wm.audio.speech.start",
+                "wm.audio.speech.end",
+                "wm.stt.partial",
+                "wm.stt.final",
+                "wm.stt.uncertain",
+                "wm.brain.reply",
+            ]
+        );
     }
 
     #[test]

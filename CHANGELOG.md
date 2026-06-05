@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.7.0 — 2026-06-05
+
+propagate turn_id from wm.stt.final onto wm.dialog.turn.user / wm.dialog.state (PRD lucid-turn-id AC3/AC5)
+
 ## v0.6.0 — 2026-05-30
 
 Add DegradeBank with per-kind rotating cursors to wintermute-dialog.

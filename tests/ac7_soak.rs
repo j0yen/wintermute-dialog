@@ -52,6 +52,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "what time is it".to_string(),
                     confidence: 0.95,
+                    turn_id: None,
                 },
                 t0 + 500,
             );
@@ -70,6 +71,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "delete the inbox".to_string(),
                     confidence: 0.95,
+                    turn_id: None,
                 },
                 t0 + 500,
             );
@@ -85,6 +87,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "yes delete-inbox".to_string(),
                     confidence: 0.97,
+                    turn_id: None,
                 },
                 t0 + 1500,
             );
@@ -96,6 +99,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "drop the table".to_string(),
                     confidence: 0.95,
+                    turn_id: None,
                 },
                 t0 + 500,
             );
@@ -111,6 +115,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "no".to_string(),
                     confidence: 0.96,
+                    turn_id: None,
                 },
                 t0 + 1500,
             );
@@ -122,6 +127,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "wipe the disk".to_string(),
                     confidence: 0.95,
+                    turn_id: None,
                 },
                 t0 + 500,
             );
@@ -150,6 +156,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "format the laptop".to_string(),
                     confidence: 0.95,
+                    turn_id: None,
                 },
                 t0 + 500,
             );
@@ -175,6 +182,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "set a timer".to_string(),
                     confidence: 0.94,
+                    turn_id: None,
                 },
                 t0 + 1200,
             );
@@ -193,6 +201,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "tell me a story".to_string(),
                     confidence: 0.95,
+                    turn_id: None,
                 },
                 t0 + 500,
             );
@@ -209,6 +218,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "never mind".to_string(),
                     confidence: 0.95,
+                    turn_id: None,
                 },
                 t0 + 1700,
             );
@@ -232,6 +242,7 @@ fn drive_turn(fsm: &mut Fsm, scenario: Scenario, t0: u64) {
                 Event::SttFinal {
                     transcript: "weather please".to_string(),
                     confidence: 0.95,
+                    turn_id: None,
                 },
                 t0 + 900,
             );

@@ -68,6 +68,7 @@ async fn run_bus_smoke() -> Result<(), String> {
         broadcast_capacity: 1024,
         drain_grace_ms: agorabus::DEFAULT_DRAIN_GRACE_MS,
         drain_resume_hint_ms: agorabus::DEFAULT_DRAIN_RESUME_HINT_MS,
+        ..DaemonConfig::defaults()
     };
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let (bus_shutdown_tx, bus_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
