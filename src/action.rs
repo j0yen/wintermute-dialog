@@ -116,6 +116,28 @@ pub enum Action {
     },
     /// Cancel any in-flight think-timeout timer.
     CancelThinkTimer,
+    /// Start (or restart) the brain-reply fallback timer.
+    ///
+    /// Fired when `wm.stt.final` is forwarded: if `wm.brain.reply` does
+    /// not arrive within `ms` milliseconds, the FSM speaks a canned phrase
+    /// and returns to Idle (voice-dialog-fallback AC1, AC3, AC4).
+    StartBrainFallbackTimer {
+        /// Timeout in milliseconds (`WM_DIALOG_BRAIN_TIMEOUT_MS`, default 8 000).
+        ms: u32,
+    },
+    /// Cancel any in-flight brain-reply fallback timer.
+    CancelBrainFallbackTimer,
+    /// Start (or restart) the STT-result fallback timer.
+    ///
+    /// Fired when `wm.audio.speech.end` is observed: if no STT result
+    /// arrives within `ms` milliseconds the FSM speaks a canned phrase and
+    /// returns to Idle (voice-dialog-fallback AC2, AC3, AC4).
+    StartSttFallbackTimer {
+        /// Timeout in milliseconds (`WM_DIALOG_STT_TIMEOUT_MS`, default 12 000).
+        ms: u32,
+    },
+    /// Cancel any in-flight STT-result fallback timer.
+    CancelSttFallbackTimer,
 }
 
 /// Why a verbal-confirm flow ended in deny.

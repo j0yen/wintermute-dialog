@@ -71,6 +71,16 @@ pub enum Event {
     /// `wm.brain.error` — brain encountered an error processing the
     /// utterance; triggers degrade-path TTS then returns to Idle.
     BrainError,
+    /// Internal fallback-brain-timeout tick: `wm.stt.final` was forwarded
+    /// to the brain but `wm.brain.reply` did not arrive within the
+    /// configurable deadline (`WM_DIALOG_BRAIN_TIMEOUT_MS`, default 8 s).
+    /// The FSM speaks a canned phrase and returns to Idle.
+    FallbackBrainTimeout,
+    /// Internal fallback-STT-timeout tick: `wm.audio.speech.end` was
+    /// observed but no STT result arrived within the configurable deadline
+    /// (`WM_DIALOG_STT_TIMEOUT_MS`, default 12 s). The FSM speaks a canned
+    /// phrase and returns to Idle.
+    FallbackSttTimeout,
 }
 
 /// Payload-less event identifier used in transition history entries.
@@ -111,6 +121,10 @@ pub enum EventTag {
     ThinkTimeout,
     /// See [`Event::BrainError`].
     BrainError,
+    /// See [`Event::FallbackBrainTimeout`].
+    FallbackBrainTimeout,
+    /// See [`Event::FallbackSttTimeout`].
+    FallbackSttTimeout,
 }
 
 impl Event {
@@ -135,6 +149,8 @@ impl Event {
             Self::TranscribeTimeout => EventTag::TranscribeTimeout,
             Self::ThinkTimeout => EventTag::ThinkTimeout,
             Self::BrainError => EventTag::BrainError,
+            Self::FallbackBrainTimeout => EventTag::FallbackBrainTimeout,
+            Self::FallbackSttTimeout => EventTag::FallbackSttTimeout,
         }
     }
 }
@@ -189,6 +205,8 @@ mod tests {
             (Event::TranscribeTimeout, EventTag::TranscribeTimeout),
             (Event::ThinkTimeout, EventTag::ThinkTimeout),
             (Event::BrainError, EventTag::BrainError),
+            (Event::FallbackBrainTimeout, EventTag::FallbackBrainTimeout),
+            (Event::FallbackSttTimeout, EventTag::FallbackSttTimeout),
         ];
         for (ev, expected) in pairs {
             assert_eq!(ev.tag(), *expected);
