@@ -230,7 +230,13 @@ pub fn read_snapshot(path: &Path) -> Result<Option<StateSnapshot>> {
     Ok(Some(snap))
 }
 
-/// Drives [`Action::StartConfirmTimer`] / [`Action::CancelConfirmTimer`].
+/// Drives a one-shot sleep-based timer that injects a fixed [`Event`] back
+/// into the dispatch loop after a configurable delay.
+///
+/// Used for [`Action::StartConfirmTimer`] / [`Action::CancelConfirmTimer`],
+/// [`Action::StartBrainFallbackTimer`] / [`Action::CancelBrainFallbackTimer`],
+/// and [`Action::StartSttFallbackTimer`] / [`Action::CancelSttFallbackTimer`]
+/// (voice-dialog-fallback).
 ///
 /// Owns the in-flight `sleep`-then-emit task. `start` and `cancel`
 /// invalidate the prior generation via an [`AtomicBool`] so a late send
@@ -239,32 +245,45 @@ pub struct ConfirmTimer {
     /// Activation flag for the *current* generation. Each `start`
     /// installs a fresh `Arc`; old tasks check this before sending.
     active: Arc<AtomicBool>,
-    /// Channel back into the dispatch loop for [`Event::ConfirmTimeout`].
+    /// Channel back into the dispatch loop.
     events_tx: mpsc::UnboundedSender<Event>,
+    /// The event to emit when the timer fires.
+    fire_event: Event,
 }
 
 impl ConfirmTimer {
-    /// Construct a timer that feeds events into `events_tx`.
+    /// Construct a timer that feeds `fire_event` into `events_tx` when it fires.
     #[must_use]
-    pub fn new(events_tx: mpsc::UnboundedSender<Event>) -> Self {
+    pub fn new_with_event(events_tx: mpsc::UnboundedSender<Event>, fire_event: Event) -> Self {
         Self {
             active: Arc::new(AtomicBool::new(false)),
             events_tx,
+            fire_event,
         }
     }
 
-    /// Schedule [`Event::ConfirmTimeout`] to fire after `ms`
-    /// milliseconds. Replaces any in-flight timer: the prior generation
-    /// flips its flag to inactive and its late send becomes a no-op.
+    /// Construct a [`ConfirmTimer`] that fires [`Event::ConfirmTimeout`].
+    ///
+    /// Preserves the original API so callers that don't need to specify the
+    /// event can continue to use the short form.
+    #[must_use]
+    pub fn new(events_tx: mpsc::UnboundedSender<Event>) -> Self {
+        Self::new_with_event(events_tx, Event::ConfirmTimeout)
+    }
+
+    /// Schedule `fire_event` to fire after `ms` milliseconds. Replaces any
+    /// in-flight timer: the prior generation flips its flag to inactive and
+    /// its late send becomes a no-op.
     pub fn start(&mut self, ms: u32) {
         self.cancel();
         let active = Arc::new(AtomicBool::new(true));
         self.active = Arc::clone(&active);
         let tx = self.events_tx.clone();
+        let event = self.fire_event.clone();
         let delay = Duration::from_millis(u64::from(ms));
         tokio::spawn(async move {
             sleep(delay).await;
-            if active.load(Ordering::SeqCst) && tx.send(Event::ConfirmTimeout).is_err() {
+            if active.load(Ordering::SeqCst) && tx.send(event).is_err() {
                 // Receiver dropped — daemon shutting down. Silent.
             }
         });
@@ -334,7 +353,11 @@ pub const fn topic_for_action(action: &Action) -> Option<&'static str> {
         | Action::StartTranscribeTimer { .. }
         | Action::CancelTranscribeTimer
         | Action::StartThinkTimer { .. }
-        | Action::CancelThinkTimer => None,
+        | Action::CancelThinkTimer
+        | Action::StartBrainFallbackTimer { .. }
+        | Action::CancelBrainFallbackTimer
+        | Action::StartSttFallbackTimer { .. }
+        | Action::CancelSttFallbackTimer => None,
     }
 }
 
@@ -414,13 +437,17 @@ pub fn action_to_value(action: &Action, ts: u64) -> Result<Option<Value>> {
         | Action::StartTranscribeTimer { .. }
         | Action::CancelTranscribeTimer
         | Action::StartThinkTimer { .. }
-        | Action::CancelThinkTimer => None,
+        | Action::CancelThinkTimer
+        | Action::StartBrainFallbackTimer { .. }
+        | Action::CancelBrainFallbackTimer
+        | Action::StartSttFallbackTimer { .. }
+        | Action::CancelSttFallbackTimer => None,
     })
 }
 
 /// Dispatch one decoded request: feed it to the FSM, then publish every
 /// resulting action through `publish` and drive every timer action
-/// through `timer`.
+/// through the appropriate timer.
 ///
 /// # Errors
 /// Returns the first publish failure encountered while flushing the
@@ -429,6 +456,8 @@ pub async fn dispatch(
     state: &DaemonState,
     publish: &mut dyn EventSink,
     timer: &mut ConfirmTimer,
+    brain_fallback_timer: &mut ConfirmTimer,
+    stt_fallback_timer: &mut ConfirmTimer,
     event: Event,
     now_ms: u64,
 ) -> Result<()> {
@@ -447,6 +476,10 @@ pub async fn dispatch(
             None => match action {
                 Action::StartConfirmTimer { ms } => timer.start(*ms),
                 Action::CancelConfirmTimer => timer.cancel(),
+                Action::StartBrainFallbackTimer { ms } => brain_fallback_timer.start(*ms),
+                Action::CancelBrainFallbackTimer => brain_fallback_timer.cancel(),
+                Action::StartSttFallbackTimer { ms } => stt_fallback_timer.start(*ms),
+                Action::CancelSttFallbackTimer => stt_fallback_timer.cancel(),
                 _ => {}
             },
         }
@@ -484,6 +517,16 @@ pub async fn run() -> Result<()> {
     let state = fresh_state(now_unix_ms());
     let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<Event>();
     let mut timer = ConfirmTimer::new(timer_tx);
+    let (brain_fallback_tx, mut brain_fallback_rx) = mpsc::unbounded_channel::<Event>();
+    let mut brain_fallback_timer = ConfirmTimer::new_with_event(
+        brain_fallback_tx,
+        Event::FallbackBrainTimeout,
+    );
+    let (stt_fallback_tx, mut stt_fallback_rx) = mpsc::unbounded_channel::<Event>();
+    let mut stt_fallback_timer = ConfirmTimer::new_with_event(
+        stt_fallback_tx,
+        Event::FallbackSttTimeout,
+    );
 
     // `WM_DIALOG_BUS_SOCKET` override mirrors `wm-stt`'s `WM_STT_BUS_SOCKET`
     // / `wm-tts`'s `WM_TTS_BUS_SOCKET` idiom and lets `tests/bus_smoke.rs`
@@ -600,7 +643,15 @@ pub async fn run() -> Result<()> {
                     Ok(request) => {
                         let event = request_to_event(request);
                         let now = now_unix_ms();
-                        if let Err(err) = dispatch(state.as_ref(), &mut sink, &mut timer, event, now).await {
+                        if let Err(err) = dispatch(
+                            state.as_ref(),
+                            &mut sink,
+                            &mut timer,
+                            &mut brain_fallback_timer,
+                            &mut stt_fallback_timer,
+                            event,
+                            now,
+                        ).await {
                             error!(topic = %ev.topic, err = %err, "wm-dialog: dispatch failed");
                         }
                         write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now).await;
@@ -612,8 +663,46 @@ pub async fn run() -> Result<()> {
             }
             Some(event) = timer_rx.recv() => {
                 let now = now_unix_ms();
-                if let Err(err) = dispatch(state.as_ref(), &mut sink, &mut timer, event, now).await {
+                if let Err(err) = dispatch(
+                    state.as_ref(),
+                    &mut sink,
+                    &mut timer,
+                    &mut brain_fallback_timer,
+                    &mut stt_fallback_timer,
+                    event,
+                    now,
+                ).await {
                     error!(err = %err, "wm-dialog: timer dispatch failed");
+                }
+                write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now).await;
+            }
+            Some(event) = brain_fallback_rx.recv() => {
+                let now = now_unix_ms();
+                if let Err(err) = dispatch(
+                    state.as_ref(),
+                    &mut sink,
+                    &mut timer,
+                    &mut brain_fallback_timer,
+                    &mut stt_fallback_timer,
+                    event,
+                    now,
+                ).await {
+                    error!(err = %err, "wm-dialog: brain-fallback timer dispatch failed");
+                }
+                write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now).await;
+            }
+            Some(event) = stt_fallback_rx.recv() => {
+                let now = now_unix_ms();
+                if let Err(err) = dispatch(
+                    state.as_ref(),
+                    &mut sink,
+                    &mut timer,
+                    &mut brain_fallback_timer,
+                    &mut stt_fallback_timer,
+                    event,
+                    now,
+                ).await {
+                    error!(err = %err, "wm-dialog: stt-fallback timer dispatch failed");
                 }
                 write_state_snapshot_best_effort(state.as_ref(), &snapshot_path, now).await;
             }
@@ -683,6 +772,29 @@ mod tests {
     fn fresh_timer() -> (ConfirmTimer, mpsc::UnboundedReceiver<Event>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (ConfirmTimer::new(tx), rx)
+    }
+
+    /// Construct a fresh [`ConfirmTimer`] that fires `event`.
+    fn fresh_timer_event(
+        event: Event,
+    ) -> (ConfirmTimer, mpsc::UnboundedReceiver<Event>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (ConfirmTimer::new_with_event(tx, event), rx)
+    }
+
+    /// Convenience wrapper for tests that don't exercise the fallback timers.
+    /// Provides no-op fallback timers so all existing test call sites continue
+    /// to compile with the updated [`dispatch`] signature.
+    async fn test_dispatch(
+        state: &DaemonState,
+        sink: &mut dyn EventSink,
+        timer: &mut ConfirmTimer,
+        event: Event,
+        now_ms: u64,
+    ) -> Result<()> {
+        let (mut bt, _) = fresh_timer_event(Event::FallbackBrainTimeout);
+        let (mut st, _) = fresh_timer_event(Event::FallbackSttTimeout);
+        dispatch(state, sink, timer, &mut bt, &mut st, event, now_ms).await
     }
 
     /// In-memory publish sink for unit tests.
@@ -920,7 +1032,7 @@ mod tests {
         let state = fresh_state(0);
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 100)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 100)
             .await
             .expect("dispatch ok");
         // turn-fsm: wake now also publishes wm.dialog.attention before state.
@@ -945,14 +1057,14 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Drive to Transcribing first.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .expect("wake");
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .expect("speech start");
         sink.events.lock().unwrap().clear();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1004,13 +1116,13 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Drive to Thinking.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1025,7 +1137,7 @@ mod tests {
         .unwrap();
         sink.events.lock().unwrap().clear();
 
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1057,13 +1169,13 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Drive to Speaking.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1076,7 +1188,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1090,7 +1202,7 @@ mod tests {
         sink.events.lock().unwrap().clear();
 
         // Wake during speaking → barge-in.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 50)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 50)
             .await
             .expect("barge-in");
         let topics = sink.topics();
@@ -1118,13 +1230,13 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Drive to Thinking.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1139,7 +1251,7 @@ mod tests {
         .unwrap();
         sink.events.lock().unwrap().clear();
 
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1180,7 +1292,7 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Engage child lock + drive to Thinking.
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1189,13 +1301,13 @@ mod tests {
         )
         .await
         .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1210,7 +1322,7 @@ mod tests {
         .unwrap();
         sink.events.lock().unwrap().clear();
 
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1276,10 +1388,10 @@ mod tests {
             )
             .await
             .unwrap();
-            dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
                 .await
                 .unwrap();
-            dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
                 .await
                 .unwrap();
             dispatch(
@@ -1340,13 +1452,13 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Mute from idle: publishes wm.audio.mute only (no state transition).
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::MuteRequest, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::MuteRequest, 10)
             .await
             .expect("mute");
         assert_eq!(sink.topics(), vec![outgoing::AUDIO_MUTE.to_string()]);
         sink.events.lock().unwrap().clear();
 
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::UnmuteRequest, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::UnmuteRequest, 20)
             .await
             .expect("unmute");
         assert_eq!(sink.topics(), vec![outgoing::AUDIO_UNMUTE.to_string()]);
@@ -1418,13 +1530,13 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Drive to Confirming (destructive reply arms the timer).
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1437,7 +1549,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1452,7 +1564,7 @@ mod tests {
         .unwrap();
         assert!(timer.is_active(), "destructive prompt armed the timer");
         // A grant utterance emits CancelConfirmTimer; that clears the flag.
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1486,13 +1598,13 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, mut rx) = fresh_timer();
         // Drive to Confirming.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1505,7 +1617,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1532,7 +1644,7 @@ mod tests {
         // Feed the timer event back through dispatch — with max_reprompts=0
         // the FSM immediately publishes: TtsSay (warm close), ConfirmDenied(silence),
         // State(idle). CancelConfirmTimer clears the flag.
-        dispatch(state.as_ref(), &mut sink, &mut timer, ev, 100)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, ev, 100)
             .await
             .expect("timeout dispatch");
         let topics = sink.topics();
@@ -1567,13 +1679,13 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Idle → Listening → Thinking → Speaking.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1586,7 +1698,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1601,7 +1713,7 @@ mod tests {
 
         // Wake during speaking → measured dispatch.
         let t0 = std::time::Instant::now();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 50)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 50)
             .await
             .expect("barge-in dispatch");
         let elapsed = t0.elapsed();
@@ -1639,13 +1751,13 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Drive to Speaking.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1658,7 +1770,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1673,7 +1785,7 @@ mod tests {
 
         // Measured mute dispatch.
         let t_mute = std::time::Instant::now();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::MuteRequest, 50)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::MuteRequest, 50)
             .await
             .expect("mute dispatch");
         let mute_elapsed = t_mute.elapsed();
@@ -1694,7 +1806,7 @@ mod tests {
         // While muted, wake is gated (no transition out of Idle, no
         // outgoing topics beyond what we already saw).
         let topics_before_wake = mute_topics.clone();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 60)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 60)
             .await
             .expect("muted wake dispatch");
         assert_eq!(
@@ -1705,7 +1817,7 @@ mod tests {
 
         // Unmute restores; measured dispatch should land STATE on the sink.
         let t_unmute = std::time::Instant::now();
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1750,7 +1862,7 @@ mod tests {
         let state = fresh_state(0);
         let (mut timer, _rx) = fresh_timer();
         let mut sink = MemSink::default();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 100)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 100)
             .await
             .expect("wake dispatch");
 
@@ -1824,15 +1936,15 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Drive FSM to Transcribing.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
         sink.events.lock().unwrap().clear();
 
-        dispatch(
+        test_dispatch(
             state.as_ref(),
             &mut sink,
             &mut timer,
@@ -1870,10 +1982,10 @@ mod tests {
         let mut sink = MemSink::default();
         let (mut timer, _trx) = fresh_timer();
         // Drive FSM to Transcribing.
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
             .await
             .unwrap();
-        dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
             .await
             .unwrap();
         sink.events.lock().unwrap().clear();
@@ -1892,7 +2004,7 @@ mod tests {
         .expect("legacy stt.final decodes (AC5)");
         let event = request_to_event(req);
 
-        dispatch(state.as_ref(), &mut sink, &mut timer, event, 30)
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, event, 30)
             .await
             .expect("dispatch legacy stt.final");
 
@@ -1908,5 +2020,340 @@ mod tests {
                 || state_ev["turn_id"].is_null(),
             "dialog.state must NOT carry turn_id when absent (AC5); got {state_ev:?}"
         );
+    }
+
+    // ── voice-dialog-fallback acceptance tests ───────────────────────
+
+    /// AC1: when `wm.brain.reply` does not arrive within the brain-reply
+    /// fallback timeout, TTS receives the canned "didn't catch that" phrase.
+    /// Uses a 100 ms override to keep the test fast.
+    #[tokio::test]
+    async fn ac1_fallback_brain_timeout_fires_tts_speak() {
+        use crate::config::DialogTimingConfig;
+        let timing = DialogTimingConfig {
+            brain_reply_timeout_ms: 100,
+            ..DialogTimingConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(Fsm::with_timing(0, timing)));
+        let mut sink = MemSink::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut brain_fallback_timer =
+            ConfirmTimer::new_with_event(tx, Event::FallbackBrainTimeout);
+        let (mut confirm_timer, _) = fresh_timer();
+        let (mut stt_fallback_timer, _) = fresh_timer_event(Event::FallbackSttTimeout);
+
+        // Drive to Thinking.
+        test_dispatch(state.as_ref(), &mut sink, &mut confirm_timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        test_dispatch(state.as_ref(), &mut sink, &mut confirm_timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut confirm_timer,
+            &mut brain_fallback_timer,
+            &mut stt_fallback_timer,
+            Event::SttFinal {
+                transcript: "hey".into(),
+                confidence: 0.9,
+                turn_id: None,
+            },
+            30,
+        )
+        .await
+        .unwrap();
+        sink.events.lock().unwrap().clear();
+
+        // Wait for the 100 ms fallback timer to fire.
+        let ev = timeout(StdDuration::from_millis(500), rx.recv())
+            .await
+            .expect("brain-fallback timer fired")
+            .expect("channel open");
+        assert_eq!(ev, Event::FallbackBrainTimeout, "AC1: correct event type");
+
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut confirm_timer,
+            &mut brain_fallback_timer,
+            &mut stt_fallback_timer,
+            ev,
+            200,
+        )
+        .await
+        .expect("AC1: fallback dispatch ok");
+
+        let topics = sink.topics();
+        assert!(
+            topics.contains(&outgoing::TTS_SPEAK.to_string()),
+            "AC1: brain-fallback must emit TTS; got {topics:?}"
+        );
+        let say = sink.payload(outgoing::TTS_SPEAK);
+        assert!(
+            say["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("didn't catch that"),
+            "AC1: TTS text must contain 'didn't catch that'; got {say:?}"
+        );
+        let state_p = sink.payload(outgoing::STATE);
+        assert_eq!(state_p["state"], "idle", "AC1: fallback resets to idle");
+    }
+
+    /// AC2: when `wm.stt.final` does not arrive within the STT fallback
+    /// timeout, TTS receives the canned "didn't hear that clearly" phrase.
+    /// Uses a 100 ms override to keep the test fast.
+    #[tokio::test]
+    async fn ac2_fallback_stt_timeout_fires_tts_speak() {
+        use crate::config::DialogTimingConfig;
+        let timing = DialogTimingConfig {
+            stt_fallback_timeout_ms: 100,
+            ..DialogTimingConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(Fsm::with_timing(0, timing)));
+        let mut sink = MemSink::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut stt_fallback_timer =
+            ConfirmTimer::new_with_event(tx, Event::FallbackSttTimeout);
+        let (mut confirm_timer, _) = fresh_timer();
+        let (mut brain_fallback_timer, _) = fresh_timer_event(Event::FallbackBrainTimeout);
+
+        // Drive to Transcribing.
+        test_dispatch(state.as_ref(), &mut sink, &mut confirm_timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut confirm_timer,
+            &mut brain_fallback_timer,
+            &mut stt_fallback_timer,
+            Event::AudioSpeechStart,
+            20,
+        )
+        .await
+        .unwrap();
+        sink.events.lock().unwrap().clear();
+
+        // Wait for the 100 ms STT fallback timer to fire.
+        let ev = timeout(StdDuration::from_millis(500), rx.recv())
+            .await
+            .expect("stt-fallback timer fired")
+            .expect("channel open");
+        assert_eq!(ev, Event::FallbackSttTimeout, "AC2: correct event type");
+
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut confirm_timer,
+            &mut brain_fallback_timer,
+            &mut stt_fallback_timer,
+            ev,
+            200,
+        )
+        .await
+        .expect("AC2: STT fallback dispatch ok");
+
+        let topics = sink.topics();
+        assert!(
+            topics.contains(&outgoing::TTS_SPEAK.to_string()),
+            "AC2: stt-fallback must emit TTS; got {topics:?}"
+        );
+        let say = sink.payload(outgoing::TTS_SPEAK);
+        assert!(
+            say["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("didn't hear that clearly"),
+            "AC2: TTS text must contain 'didn't hear that clearly'; got {say:?}"
+        );
+        let state_p = sink.payload(outgoing::STATE);
+        assert_eq!(state_p["state"], "idle", "AC2: fallback resets to idle");
+    }
+
+    /// AC3: when a normal turn completes (brain replies), neither fallback
+    /// timer fires within a generous observation window.
+    #[tokio::test]
+    async fn ac3_normal_turn_no_fallback_fires() {
+        use crate::config::DialogTimingConfig;
+        // Short timeouts so any accidental fire happens within the test window.
+        let timing = DialogTimingConfig {
+            brain_reply_timeout_ms: 50,
+            stt_fallback_timeout_ms: 50,
+            ..DialogTimingConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(Fsm::with_timing(0, timing)));
+        let mut sink = MemSink::default();
+        let (brain_tx, mut brain_rx) = mpsc::unbounded_channel();
+        let mut brain_fallback_timer =
+            ConfirmTimer::new_with_event(brain_tx, Event::FallbackBrainTimeout);
+        let (stt_tx, mut stt_rx) = mpsc::unbounded_channel();
+        let mut stt_fallback_timer =
+            ConfirmTimer::new_with_event(stt_tx, Event::FallbackSttTimeout);
+        let (mut confirm_timer, _) = fresh_timer();
+
+        // Full happy-path turn: wake → speech → stt.final → brain.reply.
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut confirm_timer,
+            &mut brain_fallback_timer,
+            &mut stt_fallback_timer,
+            Event::AudioWake,
+            10,
+        )
+        .await
+        .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut confirm_timer,
+            &mut brain_fallback_timer,
+            &mut stt_fallback_timer,
+            Event::AudioSpeechStart,
+            20,
+        )
+        .await
+        .unwrap();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut confirm_timer,
+            &mut brain_fallback_timer,
+            &mut stt_fallback_timer,
+            Event::SttFinal {
+                transcript: "ok".into(),
+                confidence: 0.99,
+                turn_id: None,
+            },
+            30,
+        )
+        .await
+        .unwrap();
+        // Brain replies quickly — both fallback timers should be cancelled.
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut confirm_timer,
+            &mut brain_fallback_timer,
+            &mut stt_fallback_timer,
+            Event::BrainReply { text: "all good".into() },
+            40,
+        )
+        .await
+        .unwrap();
+
+        // Wait 200 ms — neither fallback should fire (they were cancelled).
+        let brain_res = timeout(StdDuration::from_millis(200), brain_rx.recv()).await;
+        assert!(brain_res.is_err(), "AC3: brain-fallback must not fire after normal brain.reply");
+        let stt_res = timeout(StdDuration::from_millis(200), stt_rx.recv()).await;
+        assert!(stt_res.is_err(), "AC3: stt-fallback must not fire after stt.final received");
+    }
+
+    /// AC5: after a brain-fallback timeout fires and the FSM returns to Idle,
+    /// the next wake event successfully starts a new turn (dialog not stuck).
+    #[tokio::test]
+    async fn ac5_new_turn_succeeds_after_brain_fallback() {
+        let state = fresh_state(0);
+        let mut sink = MemSink::default();
+        let (mut timer, _) = fresh_timer();
+
+        // Simulate a turn where we manually inject FallbackBrainTimeout.
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        test_dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::SttFinal {
+                transcript: "test".into(),
+                confidence: 0.9,
+                turn_id: None,
+            },
+            30,
+        )
+        .await
+        .unwrap();
+        // Inject fallback timeout directly.
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::FallbackBrainTimeout, 8030)
+            .await
+            .expect("AC5: fallback dispatch must not error");
+        sink.events.lock().unwrap().clear();
+
+        // Should be back in Idle. New wake must succeed.
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10000)
+            .await
+            .expect("AC5: new wake after fallback");
+        let state_p = sink.payload(outgoing::STATE);
+        assert_eq!(
+            state_p["state"], "listening",
+            "AC5: new turn after brain fallback must reach listening"
+        );
+    }
+
+    /// AC6: no regression in the normal wake → stt.final → brain.reply → tts
+    /// path; the existing `dispatch_brain_reply_publishes_turn_system_tts_speak_then_state`
+    /// test covers this. This additional guard verifies the action order is
+    /// unchanged after the voice-dialog-fallback changes.
+    #[tokio::test]
+    async fn ac6_normal_path_action_order_unchanged() {
+        let state = fresh_state(0);
+        let mut sink = MemSink::default();
+        let (mut timer, _) = fresh_timer();
+        // Drive to Thinking.
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioWake, 10)
+            .await
+            .unwrap();
+        test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
+            .await
+            .unwrap();
+        test_dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::SttFinal {
+                transcript: "hi".into(),
+                confidence: 0.99,
+                turn_id: None,
+            },
+            30,
+        )
+        .await
+        .unwrap();
+        sink.events.lock().unwrap().clear();
+
+        test_dispatch(
+            state.as_ref(),
+            &mut sink,
+            &mut timer,
+            Event::BrainReply { text: "hello".into() },
+            40,
+        )
+        .await
+        .expect("AC6: normal brain reply");
+
+        let topics = sink.topics();
+        assert!(
+            topics.contains(&outgoing::TURN_SYSTEM.to_string()),
+            "AC6: normal reply must emit turn.system; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::TTS_SPEAK.to_string()),
+            "AC6: normal reply must emit tts.speak; got {topics:?}"
+        );
+        assert!(
+            topics.contains(&outgoing::STATE.to_string()),
+            "AC6: normal reply must emit dialog.state; got {topics:?}"
+        );
+        let state_p = sink.payload(outgoing::STATE);
+        assert_eq!(state_p["state"], "speaking", "AC6: normal reply enters speaking");
     }
 }

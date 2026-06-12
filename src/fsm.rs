@@ -41,6 +41,16 @@ use crate::state::{ConfirmContext, Flags, State, StateTag};
 /// Default history-ring capacity. PRD §2.5 / intent-card `history_ring_size`.
 pub const DEFAULT_HISTORY_CAPACITY: usize = 256;
 
+/// Canned phrase spoken when the brain-reply fallback timer fires
+/// (voice-dialog-fallback AC1). Exact text from the PRD.
+const BRAIN_FALLBACK_PHRASE: &str =
+    "I didn't catch that — could you try again?";
+
+/// Canned phrase spoken when the STT fallback timer fires
+/// (voice-dialog-fallback AC2). Exact text from the PRD.
+const STT_FALLBACK_PHRASE: &str =
+    "I didn't hear that clearly — please try again.";
+
 /// Compile-time reference value for the verbal-confirm timeout (30 s).
 /// Kept for backward-compatibility; the FSM reads the runtime value from
 /// [`DialogTimingConfig::confirm_timeout_ms`].
@@ -213,11 +223,14 @@ impl Fsm {
 
             // ── listening ───────────────────────────────────────────
             (State::Listening, Event::AudioSpeechStart) => {
-                // Speech arrived — cancel capture timer, start transcribe timer.
+                // Speech arrived — cancel capture timer, start transcribe timer
+                // and the STT-result fallback timer (voice-dialog-fallback).
                 let transcribe_ms = self.timing.transcribe_timeout_ms;
+                let stt_fallback_ms = self.timing.stt_fallback_timeout_ms;
                 let mut acts = vec![
                     Action::CancelCaptureTimer,
                     Action::StartTranscribeTimer { ms: transcribe_ms },
+                    Action::StartSttFallbackTimer { ms: stt_fallback_ms },
                 ];
                 acts.extend(self.transition_to(
                     State::Transcribing,
@@ -241,6 +254,7 @@ impl Fsm {
                     Action::PublishDialogUnheard,
                     Action::CancelCaptureTimer,
                     Action::CancelTranscribeTimer,
+                    Action::CancelSttFallbackTimer,
                 ];
                 acts.extend(self.transition_to(
                     State::Idle,
@@ -259,10 +273,13 @@ impl Fsm {
                     turn_id,
                 },
             ) => {
-                // Cancel the transcribe timer; arm the think timer.
+                // Cancel the transcribe timer; arm the think timer and the
+                // brain-reply fallback timer (voice-dialog-fallback).
                 let think_ms = self.timing.think_timeout_ms;
+                let brain_fallback_ms = self.timing.brain_reply_timeout_ms;
                 let mut acts = vec![
                     Action::CancelTranscribeTimer,
+                    Action::CancelSttFallbackTimer,
                     Action::PublishTurnUser {
                         transcript: transcript.clone(),
                         confidence,
@@ -276,6 +293,7 @@ impl Fsm {
                         text: transcript,
                     },
                     Action::StartThinkTimer { ms: think_ms },
+                    Action::StartBrainFallbackTimer { ms: brain_fallback_ms },
                 ];
                 // Propagate turn_id into the state transition (AC3).
                 let mut state_acts = self.transition_to(
@@ -296,6 +314,7 @@ impl Fsm {
             (State::Transcribing, Event::TranscribeTimeout) => {
                 let phrase = self.degrade.next_phrase(DegradeKind::TranscribeTimeout);
                 let mut acts = vec![
+                    Action::CancelSttFallbackTimer,
                     Action::PublishTtsSay {
                         text: phrase.to_string(),
                     },
@@ -309,11 +328,31 @@ impl Fsm {
                 ));
                 acts
             }
+            // STT fallback timeout: speech ended but no STT result within the
+            // user-facing deadline (WM_DIALOG_STT_TIMEOUT_MS, default 12 s).
+            (State::Transcribing, Event::FallbackSttTimeout) => {
+                let mut acts = vec![
+                    Action::CancelTranscribeTimer,
+                    Action::PublishTtsSay {
+                        text: STT_FALLBACK_PHRASE.to_string(),
+                    },
+                    Action::PublishDialogUnheard,
+                    Action::PublishDialogTimeout,
+                ];
+                acts.extend(self.transition_to(
+                    State::Idle,
+                    EventTag::FallbackSttTimeout,
+                    now_ms,
+                ));
+                acts
+            }
             // ── thinking ────────────────────────────────────────────
             (State::Thinking, Event::BrainReply { text }) => {
-                // Cancel the think timer; enter speaking.
+                // Cancel the think timer and the brain-reply fallback timer
+                // (voice-dialog-fallback); enter speaking.
                 let mut acts = vec![
                     Action::CancelThinkTimer,
+                    Action::CancelBrainFallbackTimer,
                     Action::PublishTurnSystem { text: text.clone() },
                     Action::PublishTtsSay { text },
                 ];
@@ -328,6 +367,7 @@ impl Fsm {
             (State::Thinking, Event::ThinkTimeout) => {
                 let phrase = self.degrade.next_phrase(DegradeKind::ThinkTimeout);
                 let mut acts = vec![
+                    Action::CancelBrainFallbackTimer,
                     Action::PublishTtsSay {
                         text: phrase.to_string(),
                     },
@@ -336,11 +376,29 @@ impl Fsm {
                 acts.extend(self.transition_to(State::Idle, EventTag::ThinkTimeout, now_ms));
                 acts
             }
+            // Brain fallback timeout: brain did not reply within the user-facing
+            // deadline (WM_DIALOG_BRAIN_TIMEOUT_MS, default 8 s).
+            (State::Thinking, Event::FallbackBrainTimeout) => {
+                let mut acts = vec![
+                    Action::CancelThinkTimer,
+                    Action::PublishTtsSay {
+                        text: BRAIN_FALLBACK_PHRASE.to_string(),
+                    },
+                    Action::PublishDialogTimeout,
+                ];
+                acts.extend(self.transition_to(
+                    State::Idle,
+                    EventTag::FallbackBrainTimeout,
+                    now_ms,
+                ));
+                acts
+            }
             // Brain error: brain explicitly failed.
             (State::Thinking, Event::BrainError) => {
                 let phrase = self.degrade.next_phrase(DegradeKind::BrainError);
                 let mut acts = vec![
                     Action::CancelThinkTimer,
+                    Action::CancelBrainFallbackTimer,
                     Action::PublishTtsSay {
                         text: phrase.to_string(),
                     },
@@ -514,8 +572,9 @@ impl Fsm {
         confirm_keyword: String,
         now_ms: u64,
     ) -> Vec<Action> {
-        // Cancel the think timer — the brain replied (destructively).
-        let mut prelude = vec![Action::CancelThinkTimer];
+        // Cancel both the think timer and the brain-reply fallback timer —
+        // the brain replied (destructively). voice-dialog-fallback.
+        let mut prelude = vec![Action::CancelThinkTimer, Action::CancelBrainFallbackTimer];
         if self.flags.child_locked {
             // Silent deny — no TTS, no prompt. PRD §2.5.
             prelude.push(Action::PublishConfirmDenied {
