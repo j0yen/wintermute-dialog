@@ -452,6 +452,7 @@ pub fn action_to_value(action: &Action, ts: u64) -> Result<Option<Value>> {
 /// # Errors
 /// Returns the first publish failure encountered while flushing the
 /// FSM's action list. The outer loop logs and continues.
+#[allow(clippy::too_many_arguments, reason = "voice-dialog-fallback adds two fallback timers; a context struct would reduce arg count but defer that to a future refactor")]
 pub async fn dispatch(
     state: &DaemonState,
     publish: &mut dyn EventSink,
