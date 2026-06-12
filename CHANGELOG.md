@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.0 — 2026-06-12
+
+Add brain-reply and STT fallback timeouts (voice-dialog-fallback)
+- FallbackBrainTimeout (WM_DIALOG_BRAIN_TIMEOUT_MS, default 8s): after wm.stt.final, speak canned phrase if brain doesn't reply
+- FallbackSttTimeout (WM_DIALOG_STT_TIMEOUT_MS, default 12s): after wm.audio.speech.end, speak canned phrase if no STT result
+- Both cancel on the expected event; all 6 ACs tested
+
 ## v0.7.0 — 2026-06-05
 
 propagate turn_id from wm.stt.final onto wm.dialog.turn.user / wm.dialog.state (PRD lucid-turn-id AC3/AC5)
