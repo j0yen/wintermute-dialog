@@ -1379,7 +1379,7 @@ mod tests {
             let (mut timer, _trx) = fresh_timer();
 
             // Engage child lock + drive to Thinking.
-            dispatch(
+            test_dispatch(
                 state.as_ref(),
                 &mut sink,
                 &mut timer,
@@ -1394,7 +1394,7 @@ mod tests {
             test_dispatch(state.as_ref(), &mut sink, &mut timer, Event::AudioSpeechStart, 20)
                 .await
                 .unwrap();
-            dispatch(
+            test_dispatch(
                 state.as_ref(),
                 &mut sink,
                 &mut timer,
@@ -1410,7 +1410,7 @@ mod tests {
             sink.events.lock().unwrap().clear();
 
             let intent_id = format!("intent-{label}");
-            dispatch(
+            test_dispatch(
                 state.as_ref(),
                 &mut sink,
                 &mut timer,
