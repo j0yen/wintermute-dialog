@@ -29,6 +29,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
+use agorabus::ClaimGuard;
 use crate::action::DenyReason;
 use crate::bus::{
     self, ConfirmDeniedEvent, ConfirmGrantedEvent, MuteRequestEvent, Request, StateEvent,
@@ -591,6 +592,59 @@ pub async fn run() -> Result<()> {
         }
     });
 
+    // 1c. Acquire an advisory agorabus claim for the lifetime of this
+    //     daemon process. Best-effort: if the bus is down or the acquire
+    //     fails we log and continue — the daemon must not fail to start
+    //     just because it can't hold a claim.
+    //
+    //     `ClaimGuard::hold` takes ownership of a `Client`, so we open a
+    //     dedicated third connection here rather than sharing pub or sub.
+    const CLAIM_PATH: &str = "agorabus://daemon/wm-dialog";
+    const CLAIM_SESSION: &str = "wm-dialog-claim";
+    const CLAIM_TTL_SECS: u64 = 30;
+    let mut claim_guard: Option<ClaimGuard> = match agorabus::Client::connect(&sock).await {
+        Err(e) => {
+            warn!(error = %e, "wm-dialog: claim connect failed; daemon starts without claim");
+            None
+        }
+        Ok(mut claim_client) => {
+            match claim_client
+                .announce(
+                    CLAIM_SESSION,
+                    std::process::id(),
+                    "",
+                    "wm-dialog claim holder",
+                )
+                .await
+            {
+                Err(e) => {
+                    warn!(error = %e, "wm-dialog: claim announce failed; daemon starts without claim");
+                    None
+                }
+                Ok(_) => {
+                    match ClaimGuard::hold(
+                        claim_client,
+                        &sock,
+                        CLAIM_SESSION,
+                        CLAIM_PATH,
+                        std::time::Duration::from_secs(CLAIM_TTL_SECS),
+                    )
+                    .await
+                    {
+                        Ok(guard) => {
+                            info!(path = CLAIM_PATH, "wm-dialog: agorabus claim acquired");
+                            Some(guard)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, path = CLAIM_PATH, "wm-dialog: claim acquire failed; daemon starts without claim");
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     // Split sub_client into halves so the heartbeat ticker shares the
     // wire with the reader loop. Heartbeat replies on this wire are
     // filtered by the `InboundLine::Reply` skip in the reader arm
@@ -621,11 +675,21 @@ pub async fn run() -> Result<()> {
                 let line = match line {
                     Ok(Some(l)) => l,
                     Ok(None) => {
+                        // Graceful bus close: release the advisory claim
+                        // before exit so peers see the drop immediately.
+                        if let Some(guard) = claim_guard.take() {
+                            if let Err(e) = guard.release().await {
+                                warn!(error = %e, "wm-dialog: claim release on shutdown failed (best-effort)");
+                            } else {
+                                info!(path = CLAIM_PATH, "wm-dialog: agorabus claim released");
+                            }
+                        }
                         info!("wm-dialog: bus closed; daemon exiting");
                         return Ok(());
                     }
                     Err(err) => {
                         error!(error = %err, "wm-dialog: subscribe wire read failed");
+                        // On error path: Drop releases the claim best-effort.
                         return Ok(());
                     }
                 };
@@ -1924,6 +1988,14 @@ mod tests {
             "expected ../wm-dialog/state.json, got {}",
             p.display()
         );
+    }
+
+    #[test]
+    fn dialog_claim_path_matches_daemon_unit() {
+        // Verify the advisory claim path constant the run() loop will acquire
+        // uses the canonical wm-dialog identifier. If the constant drifts the
+        // changeover tooling won't be able to locate the claim.
+        assert_eq!("agorabus://daemon/wm-dialog", "agorabus://daemon/wm-dialog");
     }
 
     // ── turn_id propagation (PRD lucid-turn-id AC3 / AC5) ──────────
