@@ -1,5 +1,9 @@
 # Changelog
 
+## vv0.9.0 — 2026-06-13
+
+Wire wm-dialog ClaimGuard: hold agorabus://daemon/wm-dialog for process lifetime; release on SIGTERM before exit. Enables rollout warm-swap claim detection.
+
 ## v0.8.0 — 2026-06-12
 
 Add brain-reply and STT fallback timeouts (voice-dialog-fallback)
